@@ -179,7 +179,6 @@ class BedpostX(BaseInterface):
         o["bpx_dir"] = getattr(self, "_bpx", "")
         return o
 
-
 # =========
 # XTRACT (+ optional fsl_streamlines)
 # =========
@@ -188,15 +187,25 @@ class XtractInputSpec(CommandLineInputSpec):
     # Accept either a BedpostX dir or a CUDIMOT dir (both optional here; one must exist)
     bpx_dir      = Directory(exists=True, mandatory=False, desc="BedpostX directory (…/data.bedpostX)")
     cudimot_dir  = Directory(exists=True, mandatory=False, desc="CUDIMOT dir (…/data.<ModelName>)")
-    
+
     outdir    = Directory(mandatory=True, desc="Output directory for XTRACT results")
-    stdref    = File(exists=True, mandatory=True, desc="Template reference (e.g., NMT)")
-    warp_std2anat = File(exists=True, mandatory=True, desc="Warp: template->subject")
-    warp_anat2std = File(exists=True, mandatory=True, desc="Warp: subject->template")
+
+    # Standard space references and warps (conditionally required; see _run_interface)
+    stdref         = File(exists=True, mandatory=False, desc="Template reference (HUM: MNI152_T1_1mm_brain; NHP: NMT FA)")
+    warp_std2anat  = File(exists=True, mandatory=False, desc="Warp: template->subject")
+    warp_anat2std  = File(exists=True, mandatory=False, desc="Warp: subject->template")
+
+    # Species/mode controls
+    mode     = traits.Enum("hum", "nhp", usedefault=False, desc="Species mode provided by the pipeline")
+    species  = traits.Str("CUSTOM", usedefault=True, desc="Passthrough to xtract -species; overridden by mode when set")
+    mac_ext  = traits.Str("_NMT", usedefault=True, desc="Used only when mode=='nhp' -> xtract -mac_ext")
+
+    # Probtrackx options
     ptx_steplength = traits.Float(0.15, usedefault=True, desc="probtrackx2 --steplength (via ptx_options)")
-    species  = traits.Str("CUSTOM", usedefault=True)
     no_gpu   = traits.Bool(False, usedefault=True)
-    profiles_dir = Directory(exists=True, mandatory=True,
+
+    # Profiles directory (optional for HUM; required for NHP). If provided, must contain structureList
+    profiles_dir = Directory(exists=True, mandatory=False,
                              desc="XTRACT profiles directory that contains 'structureList'")
 
     # optional streamlines export with fsl_streamlines
@@ -209,6 +218,7 @@ class XtractInputSpec(CommandLineInputSpec):
     # tract viewer
     do_viewer     = traits.Bool(True, usedefault=True, desc="Generate XTRACT QC PNGs via tract_viewer.py")
     viewer_script = File(exists=True, desc="Path to tract_viewer.py")
+
 
 class XtractOutputSpec(TraitedSpec):
     outdir = Directory()
@@ -232,18 +242,19 @@ class Xtract(CommandLine):
         cud = getattr(self.inputs, "cudimot_dir", "") or ""
 
         def _looks_bedpostx(p: str) -> bool:
-            return os.path.isdir(p) and (p.endswith(".bedpostX") or
-                                         os.path.isfile(os.path.join(p, "bvals")) or
-                                         os.path.isfile(os.path.join(p, "bvecs")))
+            return os.path.isdir(p) and (
+                p.endswith(".bedpostX")
+                or os.path.isfile(os.path.join(p, "bvals"))
+                or os.path.isfile(os.path.join(p, "bvecs"))
+            )
 
         def _looks_cudimot(p: str) -> bool:
             return os.path.isdir(p) and (
-                glob.glob(os.path.join(p, "Param_*")) or
-                os.path.isfile(os.path.join(p, "dti_FA.nii.gz"))
+                glob.glob(os.path.join(p, "Param_*"))
+                or os.path.isfile(os.path.join(p, "dti_FA.nii.gz"))
             )
 
         if bpx and os.path.isdir(bpx):
-            # Accept whether it's bedpostX or CUDIMOT
             if _looks_bedpostx(bpx) or _looks_cudimot(bpx):
                 return os.path.abspath(bpx)
 
@@ -255,36 +266,134 @@ class Xtract(CommandLine):
             f"Got bpx_dir='{bpx}', cudimot_dir='{cud}'."
         )
 
+    def _fsl_std_mni_brain(self) -> str:
+        fsldir = os.environ.get("FSLDIR", "")
+        if not fsldir:
+            return ""
+        cand = os.path.join(fsldir, "data", "standard", "MNI152_T1_1mm_brain.nii.gz")
+        return cand if os.path.isfile(cand) else ""
+
     def _run_interface(self, runtime):
         outdir = os.path.abspath(self.inputs.outdir)
         os.makedirs(outdir, exist_ok=True)
-        
+
         # Resolve source dir regardless of acquisition mode
         bpx_source = self._resolve_source()
 
-        struct_list = os.path.join(os.path.abspath(self.inputs.profiles_dir), "structureList")
-        if not os.path.isfile(struct_list):
-            raise FileNotFoundError(f"[xtract] structureList not found in {self.inputs.profiles_dir}")
-        
-        # Prepare probtrackx options file
+        # Build a tiny ptx options file
         ptx_opts = os.path.join(outdir, "ptx_opts.txt")
         with open(ptx_opts, "w") as f:
             f.write(f"--steplength={self.inputs.ptx_steplength} --savepaths --opathdir")
 
+        # Determine effective mode/species
+        mode = None
+        if isdefined(self.inputs.mode) and self.inputs.mode:
+            mode = str(self.inputs.mode).lower()
+        species = str(self.inputs.species or "").strip() or "CUSTOM"
+
+        # Command base
         cmd = [
             os.path.join(FSL, "bin", "xtract"),
             "-bpx", bpx_source,
             "-out", outdir,
-            "-species", str(self.inputs.species),
-            "-stdref", os.path.abspath(self.inputs.stdref),
-            "-stdwarp", os.path.abspath(self.inputs.warp_std2anat), os.path.abspath(self.inputs.warp_anat2std),
-            "-ptx_options", ptx_opts,
-            "-p",  os.path.abspath(self.inputs.profiles_dir),
-            "-str", struct_list,
         ]
+
+        # GPU toggle
         if not self.inputs.no_gpu:
             cmd.append("-gpu")
 
+        # =========================
+        # HUM mode
+        # =========================
+        if mode == "hum":
+            cmd += ["-species", "HUMAN"]
+            profiles_dir = getattr(self.inputs, "profiles_dir", "") or ""
+            if profiles_dir:
+                struct_list = os.path.join(os.path.abspath(profiles_dir), "structureList")
+                if not os.path.isfile(struct_list):
+                    raise FileNotFoundError(f"[xtract] structureList not found in {profiles_dir}")
+
+                stdref = getattr(self.inputs, "stdref", "") or ""
+                if not stdref:
+                    stdref = self._fsl_std_mni_brain()
+                    if not stdref:
+                        raise FileNotFoundError(
+                            "[xtract] HUM mode with custom profiles_dir requires stdref; "
+                            "default MNI152_T1_1mm_brain.nii.gz not found in FSLDIR."
+                        )
+
+                cmd += ["-stdref", os.path.abspath(stdref),
+                        "-p", os.path.abspath(profiles_dir),
+                        "-str", os.path.abspath(struct_list)]
+            
+            if isdefined(self.inputs.warp_std2anat) and isdefined(self.inputs.warp_anat2std) \
+               and self.inputs.warp_std2anat and self.inputs.warp_anat2std:
+                cmd += ["-stdwarp",
+                        os.path.abspath(self.inputs.warp_std2anat),
+                        os.path.abspath(self.inputs.warp_anat2std)]
+
+        # =========================
+        # NHP mode
+        # =========================
+        elif mode == "nhp":
+            os.environ["FSLINFMRIB"] = "1"
+            mac_ext = str(getattr(self.inputs, "mac_ext", "_NMT") or "_NMT")
+            cmd += ["-species", "MACAQUE", "-mac_ext", mac_ext]
+
+            # Require stdref, warps, and profiles_dir (+structureList)
+            stdref = getattr(self.inputs, "stdref", "") or ""
+            if not stdref:
+                raise ValueError("[xtract] NHP mode requires stdref (e.g., NMT FA).")
+            if not (self.inputs.warp_std2anat and self.inputs.warp_anat2std):
+                raise ValueError("[xtract] NHP mode requires both warp_std2anat and warp_anat2std.")
+            profiles_dir = getattr(self.inputs, "profiles_dir", "") or ""
+            if not profiles_dir:
+                raise ValueError("[xtract] NHP mode requires profiles_dir containing structureList.")
+            struct_list = os.path.join(os.path.abspath(profiles_dir), "structureList")
+            if not os.path.isfile(struct_list):
+                raise FileNotFoundError(f"[xtract] structureList not found in {profiles_dir}")
+
+            cmd += [
+                "-stdref", os.path.abspath(stdref),
+                "-stdwarp", os.path.abspath(self.inputs.warp_std2anat), os.path.abspath(self.inputs.warp_anat2std),
+                "-p", os.path.abspath(profiles_dir),
+                "-str", os.path.abspath(struct_list),
+            ]
+
+        # =========================
+        # No explicit mode: fall back to explicit species behavior
+        # =========================
+        else:
+            if species.upper() == "HUMAN":
+                cmd += ["-species", "HUMAN"]
+            elif species.upper() == "MACAQUE":
+                os.environ["FSLINFMRIB"] = "1"
+                mac_ext = str(getattr(self.inputs, "mac_ext", "_NMT") or "_NMT")
+                cmd += ["-species", "MACAQUE", "-mac_ext", mac_ext]
+            else:
+                cmd += ["-species", species]
+
+            # If profiles_dir supplied, ensure structureList and std assets if needed
+            profiles_dir = getattr(self.inputs, "profiles_dir", "") or ""
+            if profiles_dir:
+                struct_list = os.path.join(os.path.abspath(profiles_dir), "structureList")
+                if not os.path.isfile(struct_list):
+                    raise FileNotFoundError(f"[xtract] structureList not found in {profiles_dir}")
+                cmd += ["-p", os.path.abspath(profiles_dir), "-str", os.path.abspath(struct_list)]
+
+            # Pass stdref/stdwarp only if both warps are provided
+            if isdefined(self.inputs.stdref) and self.inputs.stdref:
+                cmd += ["-stdref", os.path.abspath(self.inputs.stdref)]
+            if isdefined(self.inputs.warp_std2anat) and isdefined(self.inputs.warp_anat2std) \
+               and self.inputs.warp_std2anat and self.inputs.warp_anat2std:
+                cmd += ["-stdwarp",
+                        os.path.abspath(self.inputs.warp_std2anat),
+                        os.path.abspath(self.inputs.warp_anat2std)]
+
+        # Always include probtrackx options file
+        cmd += ["-ptx_options", ptx_opts]
+
+        # Execute
         subprocess.run(cmd, check=True)
 
         # ---------- optional fsl_streamlines export ----------
@@ -323,14 +432,15 @@ class Xtract(CommandLine):
                 viewer_cmd = [
                     os.path.abspath(self.inputs.viewer_script),
                     "--xtract", tracts_root,
-                    "--brain", os.path.abspath(self.inputs.stdref),
+                    "--brain", os.path.abspath(self.inputs.stdref) if isdefined(self.inputs.stdref) and self.inputs.stdref
+                               else self._fsl_std_mni_brain(),
                     "--outfile", outdir
                 ]
                 subprocess.run(viewer_cmd, check=True)
         except Exception:
             # Non-fatal if fsleyes or viewer is not available on this machine
             pass
-        
+
         runtime.returncode = 0
         return runtime
 

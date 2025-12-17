@@ -18,6 +18,7 @@ from .nodes.difftensor import DiffTensor
 from .nodes.reg import Reg2Std, MMORFReg
 from .nodes.bedpostx_xtract import FibreCudimot, BedpostX, Xtract
 from .nodes.qa_report import QAReport
+
 from .nodes.denoise import Denoise
 
 from nipype import config as nipype_config
@@ -137,7 +138,6 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
 
     # Workspace layout
     dmri_root = cfg.abs_dmri_root
-    # proc_dir = os.path.join(dmri_root, "proc")
     proc_dir = dmri_root
 
     data_rawdir = os.path.join(proc_dir, "data_raw")
@@ -152,9 +152,10 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
     os.makedirs(denoise_dir, exist_ok=True)
 
     acqtype = (getattr(cfg, "acqtype", "ssfp") or "ssfp").strip().lower()
+    mode = (getattr(cfg, "mode", "nhp") or "nhp").strip().lower()  # "nhp" | "hum"
 
     # Keep a copy of YAML used
-    if cfg.source_yaml and os.path.isfile(cfg.source_yaml):
+    if getattr(cfg, "source_yaml", None) and os.path.isfile(cfg.source_yaml):
         try:
             shutil.copy2(cfg.source_yaml, os.path.join(proc_dir, "config_used.yaml"))
         except Exception as e:
@@ -176,15 +177,15 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
     drift_dir = os.path.join(proc_dir, "drift_correction")
     spdrift_dir = os.path.join(proc_dir, "data_spatial_drift")
     eddy_root = os.path.join(proc_dir, "eddy")
-    nmt_outdir = os.path.join(proc_dir, "NMTreg")
+    stdreg_dir = os.path.join(proc_dir, "stdreg")
     xtract_out = os.path.join(proc_dir, "xtract")
     qa_outdir = os.path.join(proc_dir, "QA")
 
-    # Warp paths (if relying on on-disk)
-    warp_std2anat_fn = os.path.join(nmt_outdir, "warp_std2anat.nii.gz")
-    warp_anat2std_fn = os.path.join(nmt_outdir, "warp_anat2std.nii.gz")
-    mmorf_combined = os.path.join(nmt_outdir, "combined_warp.nii.gz")
-    mmorf_combined_inv = os.path.join(nmt_outdir, "combined_warp_inv.nii.gz")
+    # Warp paths
+    warp_anat2std_fn = os.path.join(stdreg_dir, "stdreg_anat_to_std_warp.nii.gz")
+    warp_std2anat_fn = os.path.join(stdreg_dir, "stdreg_std_to_anat_warp.nii.gz")
+    mmorf_combined = os.path.join(stdreg_dir, "combined_warp.nii.gz")
+    mmorf_combined_inv = os.path.join(stdreg_dir, "combined_warp_inv.nii.gz")
 
     # ----------------------------------------------------------
     # TRACT-ONLY MODE: assume preproc files exist on disk
@@ -204,46 +205,47 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
             bvecs_file = os.path.join(datadir, "bvecs")
             _require_files([bvals_file, bvecs_file], "preproc outputs (bvals/bvecs)")
 
-        # Warps
-        reg_method = getattr(cfg, "REG_METHOD", "FNIRT").upper().strip()
-        if reg_method == "FNIRT":
+        # Registration method
+        reg_method = (getattr(cfg, "reg_method", None) or getattr(cfg, "REG_METHOD", "FNIRT")).strip().lower()
+        if reg_method == "fnirt":
             _require_files([warp_std2anat_fn, warp_anat2std_fn], "FNIRT warps")
             warp_std2anat = warp_std2anat_fn
             warp_anat2std = warp_anat2std_fn
-        elif reg_method == "MMORF":
+        elif reg_method == "mmorf":
             _require_files([mmorf_combined, mmorf_combined_inv], "MMORF warps")
             warp_std2anat = mmorf_combined_inv
             warp_anat2std = mmorf_combined
         else:
-            raise ValueError(f"Unknown REG_METHOD: {reg_method}")
+            raise ValueError(f"Unknown reg_method: {reg_method}")
 
         # SSFP or SE tractography path
         if acqtype == "ssfp":
             fibre_deps = pe.Node(util.Merge(2), name="fibre_deps_tractonly")
             fibre_deps.inputs.in1 = mask_file
-            fa_std_guess = os.path.join(nmt_outdir, "dti_FA_in_NMT.nii.gz")
+            fa_std_guess = os.path.join(stdreg_dir, "FA_in_STD.nii.gz")
             fibre_deps.inputs.in2 = fa_std_guess if os.path.isfile(fa_std_guess) else ""
 
             fibre_node = pe.Node(FibreCudimot(), name="fibre_cudimot")
             fibre_node.inputs.subject_dir = datadir
-            fibre_node.inputs.pipeline_cmd = cfg.FIBRE_PIPELINE_CMD
-            fibre_node.inputs.init_method = cfg.FIBRE_INIT_METHOD
-            fibre_node.inputs.queue = cfg.FIBRE_QUEUE
-            fibre_node.inputs.njobs = cfg.FIBRE_NJOBS
-            fibre_node.inputs.run_mcmc = cfg.FIBRE_RUN_MCMC
-            fibre_node.inputs.no_levmar = cfg.FIBRE_NO_LEVMAR
-            fibre_node.inputs.burnin = cfg.FIBRE_BURNIN
-            fibre_node.inputs.jumps = cfg.FIBRE_JUMPS
-            fibre_node.inputs.sample_every = cfg.FIBRE_SAMPLE_EVERY
+            fibre_node.inputs.pipeline_cmd = getattr(cfg, "fibre_pipeline_cmd", getattr(cfg, "FIBRE_PIPELINE_CMD", "Pipeline_Ball_3_Sticks_2Shells_SSFP.sh"))
+            fibre_node.inputs.init_method = getattr(cfg, "fibre_init_method", getattr(cfg, "FIBRE_INIT_METHOD", ""))
+            fibre_node.inputs.queue = getattr(cfg, "fibre_queue", getattr(cfg, "FIBRE_QUEUE", ""))
+            fibre_node.inputs.njobs = int(getattr(cfg, "fibre_njobs", getattr(cfg, "FIBRE_NJOBS", 4)))
+            fibre_node.inputs.run_mcmc = bool(getattr(cfg, "fibre_run_mcmc", getattr(cfg, "FIBRE_RUN_MCMC", True)))
+            fibre_node.inputs.no_levmar = bool(getattr(cfg, "fibre_no_levmar", getattr(cfg, "FIBRE_NO_LEVMAR", True)))
+            fibre_node.inputs.burnin = int(getattr(cfg, "fibre_burnin", getattr(cfg, "FIBRE_BURNIN", 10000)))
+            fibre_node.inputs.jumps = int(getattr(cfg, "fibre_jumps", getattr(cfg, "FIBRE_JUMPS", 1250)))
+            fibre_node.inputs.sample_every = int(getattr(cfg, "fibre_sample_every", getattr(cfg, "FIBRE_SAMPLE_EVERY", 25)))
             wf.connect(fibre_deps, "out", fibre_node, "deps")
 
             xtract_node = pe.Node(Xtract(), name="xtract")
             xtract_node.inputs.outdir = xtract_out
-            xtract_node.inputs.stdref = cfg.std_ref_file
-            xtract_node.inputs.species = cfg.XTRACT_SPECIES
-            xtract_node.inputs.no_gpu = cfg.XTRACT_NO_GPU
-            xtract_node.inputs.ptx_steplength = cfg.XTRACT_PTX_STEPLEN
-            xtract_node.inputs.profiles_dir = cfg.XTRACT_PROFILES_DIR
+            xtract_node.inputs.mode = mode
+            xtract_node.inputs.stdref = getattr(cfg, "std_ref_file", None)
+            xtract_node.inputs.species = getattr(cfg, "xtract_species", getattr(cfg, "XTRACT_SPECIES", "CUSTOM"))
+            xtract_node.inputs.no_gpu = bool(getattr(cfg, "xtract_no_gpu", getattr(cfg, "XTRACT_NO_GPU", False)))
+            xtract_node.inputs.ptx_steplength = float(getattr(cfg, "xtract_ptx_steplen", getattr(cfg, "XTRACT_PTX_STEPLEN", 0.15)))
+            xtract_node.inputs.profiles_dir = getattr(cfg, "xtract_profiles_dir", getattr(cfg, "XTRACT_PROFILES_DIR", ""))
             wf.connect(fibre_node, "cudimot_dir", xtract_node, "cudimot_dir")
 
         else:
@@ -252,12 +254,12 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
 
             xtract_node = pe.Node(Xtract(), name="xtract")
             xtract_node.inputs.outdir = xtract_out
-            xtract_node.inputs.stdref = cfg.std_ref_file
-            xtract_node.inputs.species = cfg.XTRACT_SPECIES
-            xtract_node.inputs.no_gpu = cfg.XTRACT_NO_GPU
-            xtract_node.inputs.ptx_steplength = cfg.XTRACT_PTX_STEPLEN
-            xtract_node.inputs.profiles_dir = cfg.XTRACT_PROFILES_DIR
-
+            xtract_node.inputs.mode = mode
+            xtract_node.inputs.stdref = getattr(cfg, "std_ref_file", None)
+            xtract_node.inputs.species = getattr(cfg, "xtract_species", getattr(cfg, "XTRACT_SPECIES", "CUSTOM"))
+            xtract_node.inputs.no_gpu = bool(getattr(cfg, "xtract_no_gpu", getattr(cfg, "XTRACT_NO_GPU", False)))
+            xtract_node.inputs.ptx_steplength = float(getattr(cfg, "xtract_ptx_steplen", getattr(cfg, "XTRACT_PTX_STEPLEN", 0.15)))
+            xtract_node.inputs.profiles_dir = getattr(cfg, "xtract_profiles_dir", getattr(cfg, "XTRACT_PROFILES_DIR", ""))
             wf.connect(bpx_node, "bpx_dir", xtract_node, "bpx_dir")
 
         # Warps into XTRACT
@@ -266,7 +268,7 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
 
         # Viewer
         xtract_node.inputs.viewer_script = pkg_file("nodes", "tract_viewer.py")
-        xtract_node.inputs.do_viewer = bool(getattr(cfg, "DO_VIEWER", True))
+        xtract_node.inputs.do_viewer = bool(getattr(cfg, "do_viewer", True))
 
         # QA for tract-only
         qa = pe.Node(QAReport(), name="qa_report")
@@ -281,8 +283,8 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
         qa.inputs.nipype_graph_preproc = os.path.join(proc_dir, "nipype_logging", "graph.png")
 
         qa.inputs.eddy_qc_json = os.path.join(eddy_root, "eddy.qc", "qc.json")
-        qa.inputs.nmt_mask_img = pkg_file("files", "NMT_v2.0_sym_05mm_LR_brainmask.nii.gz")
-        qa.inputs.nmt_fa_img = pkg_file("files", "NMT_v2.0_sym_05mm_FA.nii.gz")
+        # standard-space outline (generic, optional)
+        qa.inputs.std_mask_img = getattr(cfg, "std_mask_file", None)
 
         # Core inputs
         qa.inputs.data_4d = os.path.join(eddy_root, "eddy.nii.gz")
@@ -363,25 +365,20 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
         img_node.inputs.T2map = cfg.maps["T2map"]
         img_node.inputs.B1map = cfg.maps["B1map"]
         img_node.inputs.outdir = data_rawdir
-        if cfg.brain_mask and os.path.isfile(cfg.brain_mask):
+        if getattr(cfg, "brain_mask", None) and os.path.isfile(cfg.brain_mask):
             img_node.inputs.brain_mask = cfg.brain_mask
     else:
         img_node = None  # SE uses provided data_nii directly
 
     # 2b) Optional denoising (immediately before Gibbs)
-    # Decide source magnitude + phase and domain
     denoise_in_mag = cfg.data_paths["data_nii"]
     denoise_in_ph  = cfg.data_paths.get("data_phase", None)
-    if acqtype == "ssfp":
-        # Use the copy under data_raw as source to keep everything in <proc>
-        # We connect to the *output* of copy_images when available.
-        pass
 
-    if cfg.RUN_DENOISE:
+    if getattr(cfg, "run_denoise", getattr(cfg, "RUN_DENOISE", False)):
         dn = pe.Node(Denoise(), name="denoise")
-        dn.inputs.denoise_sh = cfg.DENOISE_SH
-        dn.inputs.meth = cfg.DENOISE_METHOD
-        dn.inputs.name = cfg.DENOISE_NAME
+        dn.inputs.denoise_sh = getattr(cfg, "denoise_sh", getattr(cfg, "DENOISE_SH", None))
+        dn.inputs.meth = getattr(cfg, "denoise_method", getattr(cfg, "DENOISE_METHOD", "NORDIC"))
+        dn.inputs.name = getattr(cfg, "denoise_name", getattr(cfg, "DENOISE_NAME", "data"))
         dn.inputs.oPath = denoise_dir
 
         # Complex if we actually have a phase file, else magnitude
@@ -392,7 +389,6 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
 
         # Wire inputs: for SSFP use the on-boarded copy, else direct from config
         if acqtype == "ssfp":
-            # magn from CopyImagesToRaw output; phase from cfg (optional)
             wf.connect(img_node, "data_file", dn, "magn")
             if denoise_in_ph and os.path.isfile(denoise_in_ph):
                 dn.inputs.phase = denoise_in_ph
@@ -404,21 +400,21 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
         # 3) Gibbs unringing — feed from denoise output
         gibbs_node = pe.Node(Gibbs(), name="gibbs")
         gibbs_node.inputs.outdir = gibbs_dir
-        gibbs_node.inputs.run_gibbs = cfg.RUN_GIBBS
-        gibbs_node.inputs.use_docker = cfg.USE_DOCKER
-        gibbs_node.inputs.container_runtime = cfg.CONTAINER_RUNTIME
-        gibbs_node.inputs.interactive_tty = cfg.INTERACTIVE_TTY
-        gibbs_node.inputs.gibbs_image = cfg.GIBBS_IMAGE
+        gibbs_node.inputs.run_gibbs = bool(getattr(cfg, "run_gibbs", getattr(cfg, "RUN_GIBBS", True)))
+        gibbs_node.inputs.use_docker = bool(getattr(cfg, "use_docker", getattr(cfg, "USE_DOCKER", True)))
+        gibbs_node.inputs.container_runtime = getattr(cfg, "container_runtime", getattr(cfg, "CONTAINER_RUNTIME", "docker"))
+        gibbs_node.inputs.interactive_tty = bool(getattr(cfg, "interactive_tty", getattr(cfg, "INTERACTIVE_TTY", True)))
+        gibbs_node.inputs.gibbs_image = getattr(cfg, "gibbs_image", getattr(cfg, "GIBBS_IMAGE", "docker.io/mrtrix3/mrtrix3:3.0.7"))
         wf.connect(dn, "out_nii", gibbs_node, "data_nii")
     else:
         # 3) Gibbs unringing — feed from raw (SSFP copy or SE direct)
         gibbs_node = pe.Node(Gibbs(), name="gibbs")
         gibbs_node.inputs.outdir = gibbs_dir
-        gibbs_node.inputs.run_gibbs = cfg.RUN_GIBBS
-        gibbs_node.inputs.use_docker = cfg.USE_DOCKER
-        gibbs_node.inputs.container_runtime = cfg.CONTAINER_RUNTIME
-        gibbs_node.inputs.interactive_tty = cfg.INTERACTIVE_TTY
-        gibbs_node.inputs.gibbs_image = cfg.GIBBS_IMAGE
+        gibbs_node.inputs.run_gibbs = bool(getattr(cfg, "run_gibbs", getattr(cfg, "RUN_GIBBS", True)))
+        gibbs_node.inputs.use_docker = bool(getattr(cfg, "use_docker", getattr(cfg, "USE_DOCKER", True)))
+        gibbs_node.inputs.container_runtime = getattr(cfg, "container_runtime", getattr(cfg, "CONTAINER_RUNTIME", "docker"))
+        gibbs_node.inputs.interactive_tty = bool(getattr(cfg, "interactive_tty", getattr(cfg, "INTERACTIVE_TTY", True)))
+        gibbs_node.inputs.gibbs_image = getattr(cfg, "gibbs_image", getattr(cfg, "GIBBS_IMAGE", "docker.io/mrtrix3/mrtrix3:3.0.7"))
         if acqtype == "ssfp":
             wf.connect(img_node, "data_file", gibbs_node, "data_nii")
         else:
@@ -431,7 +427,7 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
     mean_b0_path = os.path.join(datadir, "mean_b0.nii.gz")
     mask_path = os.path.join(datadir, "nodif_brain_mask.nii.gz")
 
-    if cfg.brain_mask and os.path.isfile(cfg.brain_mask):
+    if getattr(cfg, "brain_mask", None) and os.path.isfile(cfg.brain_mask):
         def _copy_mask_and_meanb0(input_mask, out_mask, imain, out_meanb0, fslbin):
             import os, shutil, subprocess
             os.makedirs(os.path.dirname(out_mask), exist_ok=True)
@@ -464,7 +460,7 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
         wf.connect(gibbs_node, "out_file", mask_node, "imain")
     else:
         mask_node = pe.Node(
-            BrainMask(threshold=getattr(cfg, "brain_mask_thr", 50.0)),
+            BrainMask(threshold=float(getattr(cfg, "brain_mask_thr", getattr(cfg, "BRAIN_MASK_THR", 50.0)))),
             name="brain_mask",
         )
         wf.connect(gibbs_node, "out_file", mask_node, "data_nii")
@@ -474,20 +470,20 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
 
     # 5) Temporal drift correction
     drift_node = pe.Node(Drift(), name="drift")
-    drift_node.inputs.script = cfg.drift_py
+    drift_node.inputs.script = getattr(cfg, "drift_py", getattr(cfg, "DRIFT_PY", None))
     drift_node.inputs.model = "single"
     drift_node.inputs.outdir = os.path.join(proc_dir, "drift_correction")
     drift_node.inputs.output = ["data_corrected.nii.gz"]
-    drift_node.inputs.mask = cfg.std_mask_file
-    drift_node.inputs.vent = cfg.std_ventricles_file
-    drift_node.inputs.std = cfg.std_ref_file
+    drift_node.inputs.mask = getattr(cfg, "std_mask_file", None)
+    drift_node.inputs.vent = getattr(cfg, "std_ventricles_file", None)
+    drift_node.inputs.std = getattr(cfg, "std_ref_file", None)
     wf.connect(gibbs_node, "out_file", drift_node, "input")
     wf.connect(grads_src, "bvals_file", drift_node, "bvals")
 
     # 6) Spatial drift
     spdrift_node = pe.Node(SpatialDrift(), name="spatial_drift")
     spdrift_node.inputs.outdir = os.path.join(proc_dir, "data_spatial_drift")
-    spdrift_node.inputs.enable = cfg.RUN_SPATIAL_DRIFT
+    spdrift_node.inputs.enable = bool(getattr(cfg, "run_spatial_drift", getattr(cfg, "RUN_SPATIAL_DRIFT", True)))
     sel_drift_out = pe.Node(util.Select(index=0), name="select_drift_out")
     wf.connect(drift_node, "out_files", sel_drift_out, "inlist")
     wf.connect(sel_drift_out, "out", spdrift_node, "imain")
@@ -543,14 +539,14 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
     # 7) EDDY prep and run
     eddy_prep = pe.Node(PrepareEddy(), name="eddy_prepare")
     eddy_prep.inputs.out_root = eddy_root
-    eddy_prep.inputs.echo_spacing_sec = float(cfg.EDDY_ECHO_SEC)
+    eddy_prep.inputs.echo_spacing_sec = float(getattr(cfg, "eddy_echo_sec", getattr(cfg, "EDDY_ECHO_SEC", 0.0)))
     wf.connect(spdrift_node, "out_file", eddy_prep, "imain")
     wf.connect(grads_src, "bvals_file", eddy_prep, "bvals")
     wf.connect(grads_src, "bvecs_file", eddy_prep, "bvecs")
 
     eddy_run = pe.Node(EddyRun(), name="eddy_run")
-    eddy_run.inputs.no_gpu = cfg.NO_GPU
-    eddy_run.inputs.enable = cfg.RUN_EDDY
+    eddy_run.inputs.no_gpu = bool(getattr(cfg, "no_gpu", getattr(cfg, "NO_GPU", False)))
+    eddy_run.inputs.enable = bool(getattr(cfg, "run_eddy", getattr(cfg, "RUN_EDDY", True)))
     eddy_run.inputs.out = os.path.join(eddy_root, "eddy")
     wf.connect(eddy_prep, "imain_out", eddy_run, "imain")
     wf.connect(mask_node, "mask", eddy_run, "mask")
@@ -560,7 +556,7 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
     wf.connect(eddy_prep, "bvecs_out", eddy_run, "bvecs")
 
     eddy_qc = pe.Node(EddyQuad(), name="eddy_qc")
-    eddy_qc.inputs.enable = cfg.RUN_EDDY_QC
+    eddy_qc.inputs.enable = bool(getattr(cfg, "run_eddy_qc", getattr(cfg, "RUN_EDDY_QC", True)))
     eddy_qc.inputs.base = os.path.join(eddy_root, "eddy")
     wf.connect(eddy_prep, "index", eddy_qc, "idx")
     wf.connect(eddy_prep, "acqparams", eddy_qc, "acqp")
@@ -594,17 +590,17 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
     # 9) Diffusion tensor modelling
     dti_node = pe.Node(DiffTensor(), name="difftensor")
     dti_node.inputs.subject_dir = datadir
-    dti_node.inputs.approx_b = cfg.DTI_APPROX_B
-    dti_node.inputs.db = cfg.DTI_DB
-    dti_node.inputs.b0 = cfg.DTI_B0
+    dti_node.inputs.approx_b = int(getattr(cfg, "dti_approx_b", getattr(cfg, "DTI_APPROX_B", 1000)))
+    dti_node.inputs.db = int(getattr(cfg, "dti_db", getattr(cfg, "DTI_DB", 60)))
+    dti_node.inputs.b0 = int(getattr(cfg, "dti_b0", getattr(cfg, "DTI_B0", 0)))
     if acqtype == "ssfp":
         dti_node.inputs.sidecars_dir = sidecarsdir
-        dti_node.inputs.njobs = cfg.CUDIMOT_NJOBS
-        dti_node.inputs.run_mcmc = cfg.CUDIMOT_RUN_MCMC
-        dti_node.inputs.no_levmar = cfg.CUDIMOT_NO_LEVMAR
-        dti_node.inputs.burnin = cfg.CUDIMOT_BURNIN
-        dti_node.inputs.jumps = cfg.CUDIMOT_JUMPS
-        dti_node.inputs.sample_every = cfg.CUDIMOT_SAMPLE_EVERY
+        dti_node.inputs.njobs = int(getattr(cfg, "cudimot_njobs", getattr(cfg, "CUDIMOT_NJOBS", 4)))
+        dti_node.inputs.run_mcmc = bool(getattr(cfg, "cudimot_run_mcmc", getattr(cfg, "CUDIMOT_RUN_MCMC", True)))
+        dti_node.inputs.no_levmar = bool(getattr(cfg, "cudimot_no_levmar", getattr(cfg, "CUDIMOT_NO_LEVMAR", True)))
+        dti_node.inputs.burnin = int(getattr(cfg, "cudimot_burnin", getattr(cfg, "CUDIMOT_BURNIN", 10000)))
+        dti_node.inputs.jumps = int(getattr(cfg, "cudimot_jumps", getattr(cfg, "CUDIMOT_JUMPS", 1250)))
+        dti_node.inputs.sample_every = int(getattr(cfg, "cudimot_sample_every", getattr(cfg, "CUDIMOT_SAMPLE_EVERY", 25)))
     wf.connect(spdrift_node, "out_file", dti_node, "imain")
     wf.connect(grads_src, "bvals_file", dti_node, "bvals")
     wf.connect(grads_src, "bvecs_file", dti_node, "bvecs")
@@ -612,62 +608,54 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
     if acqtype == "ssfp" and paths_node is not None:
         wf.connect(paths_node, "FixP", dti_node, "fixp_path")
 
-    # 10) Registration to NMT
-    reg_method = getattr(cfg, "REG_METHOD", "FNIRT").upper().strip()
-    if reg_method == "FNIRT":
+    # 10) Registration to STD (FNIRT or MMORF)
+    reg_method = (getattr(cfg, "reg_method", None) or getattr(cfg, "REG_METHOD", "FNIRT")).strip().lower()
+
+    if reg_method == "fnirt":
         reg2std_py = _resolve_first_existing(
             [
-                getattr(cfg, "REG2STD_PY", None),
+                getattr(cfg, "reg2std_py", None) or getattr(cfg, "REG2STD_PY", None),
                 os.path.join(NODES_DIR, "reg2std.py"),
                 os.path.join(FILES_DIR, "reg2std.py"),
             ]
         )
         if not reg2std_py:
             raise FileNotFoundError("[FNIRT] Could not locate reg2std.py.")
-        std_atl_fa = _resolve_first_existing(
-            [
-                getattr(cfg, "std_ref_file", None),
-                os.path.join(FILES_DIR, "NMT_FA.nii.gz"),
-            ]
-        )
+        # FNIRT registration target: always use cfg.std_fa_file
+        std_atl_fa = getattr(cfg, "std_fa_file", None)
+        if not (std_atl_fa and os.path.isfile(std_atl_fa)):
+            raise FileNotFoundError(f"[FNIRT] Missing standard FA template (std_fa_file): {std_atl_fa}")
+
         if not std_atl_fa:
-            raise FileNotFoundError("[FNIRT] Could not locate NMT FA template.")
+            raise FileNotFoundError("[FNIRT] Could not locate standard FA template (std_ref_file).")
 
-        nmt_reg = pe.Node(Reg2Std(), name="reg2std")
-        nmt_reg.inputs.script = reg2std_py
-        nmt_reg.inputs.atl = std_atl_fa
-        nmt_reg.inputs.outdir = nmt_outdir
-        if getattr(cfg, "REG2STD_CONFIG", None) and os.path.isfile(cfg.REG2STD_CONFIG):
-            nmt_reg.inputs.config = cfg.REG2STD_CONFIG
-        wf.connect(dti_node, "fa_file", nmt_reg, "fa")
+        stdreg = pe.Node(Reg2Std(), name="reg2std")
+        stdreg.inputs.script = reg2std_py
+        stdreg.inputs.atl = std_atl_fa
+        stdreg.inputs.outdir = stdreg_dir
+        regcfg = getattr(cfg, "reg2std_config", None) or getattr(cfg, "REG2STD_CONFIG", None)
+        if regcfg and os.path.isfile(regcfg):
+            stdreg.inputs.config = regcfg
+        wf.connect(dti_node, "fa_file", stdreg, "fa")
 
-    elif reg_method == "MMORF":
-        std_fa = _resolve_file(getattr(cfg, "NMT_FA_FILE", None), "NMT_FA.nii.gz", FILES_DIR)
-        std_tn = _resolve_file(getattr(cfg, "NMT_TENSOR_FILE", None), "NMT_tensor.nii.gz", FILES_DIR)
+    elif reg_method == "mmorf":
+        # MMORF registration targets: use cfg.std_* targets (mode-aware defaults set in Config)
+        std_fa = getattr(cfg, "std_fa_file", None)
+        std_tn = getattr(cfg, "std_tensor_file", None)
         cfg_tpl = _resolve_file(
-            getattr(cfg, "MMORF_CONFIG_TEMPLATE", None),
+            getattr(cfg, "mmorf_config_template", None) or getattr(cfg, "MMORF_CONFIG_TEMPLATE", None),
             "mmorf_config_template.ini",
             FILES_DIR,
         )
-        missing = []
-        if not std_fa:
-            missing.append("NMT FA")
-        if not std_tn:
-            missing.append("NMT tensor")
-        if not cfg_tpl:
-            missing.append("MMORF config template")
-        if missing:
-            raise FileNotFoundError("[MMORF] Missing: " + ", ".join(missing))
-
-        nmt_reg = pe.Node(MMORFReg(), name="mmorf_reg")
-        nmt_reg.inputs.outdir = nmt_outdir
-        nmt_reg.inputs.std_ref_fa = std_fa
-        nmt_reg.inputs.std_ref_tensor = std_tn
-        nmt_reg.inputs.config_template = cfg_tpl
-        wf.connect(dti_node, "fa_file", nmt_reg, "fa")
-        wf.connect(dti_node, "tensor_file", nmt_reg, "tensor")
+        stdreg = pe.Node(MMORFReg(), name="mmorf_reg")
+        stdreg.inputs.outdir = stdreg_dir
+        stdreg.inputs.std_ref_fa = std_fa
+        stdreg.inputs.std_ref_tensor = std_tn
+        stdreg.inputs.config_template = cfg_tpl
+        wf.connect(dti_node, "fa_file", stdreg, "fa")
+        wf.connect(dti_node, "tensor_file", stdreg, "tensor")
     else:
-        raise ValueError(f"Unknown REG_METHOD: {reg_method}")
+        raise ValueError(f"Unknown reg_method: {reg_method}")
 
     # 11) Fibre + XTRACT (only in FULL mode)
     xtract_node = None
@@ -682,24 +670,25 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
 
             fibre_node = pe.Node(FibreCudimot(), name="fibre_cudimot")
             fibre_node.inputs.subject_dir = datadir
-            fibre_node.inputs.pipeline_cmd = cfg.FIBRE_PIPELINE_CMD
-            fibre_node.inputs.init_method = cfg.FIBRE_INIT_METHOD
-            fibre_node.inputs.queue = cfg.FIBRE_QUEUE
-            fibre_node.inputs.njobs = cfg.FIBRE_NJOBS
-            fibre_node.inputs.run_mcmc = cfg.FIBRE_RUN_MCMC
-            fibre_node.inputs.no_levmar = cfg.FIBRE_NO_LEVMAR
-            fibre_node.inputs.burnin = cfg.FIBRE_BURNIN
-            fibre_node.inputs.jumps = cfg.FIBRE_JUMPS
-            fibre_node.inputs.sample_every = cfg.FIBRE_SAMPLE_EVERY
+            fibre_node.inputs.pipeline_cmd = getattr(cfg, "fibre_pipeline_cmd", getattr(cfg, "FIBRE_PIPELINE_CMD", "Pipeline_Ball_3_Sticks_2Shells_SSFP.sh"))
+            fibre_node.inputs.init_method = getattr(cfg, "fibre_init_method", getattr(cfg, "FIBRE_INIT_METHOD", ""))
+            fibre_node.inputs.queue = getattr(cfg, "fibre_queue", getattr(cfg, "FIBRE_QUEUE", ""))
+            fibre_node.inputs.njobs = int(getattr(cfg, "fibre_njobs", getattr(cfg, "FIBRE_NJOBS", 4)))
+            fibre_node.inputs.run_mcmc = bool(getattr(cfg, "fibre_run_mcmc", getattr(cfg, "FIBRE_RUN_MCMC", True)))
+            fibre_node.inputs.no_levmar = bool(getattr(cfg, "fibre_no_levmar", getattr(cfg, "FIBRE_NO_LEVMAR", True)))
+            fibre_node.inputs.burnin = int(getattr(cfg, "fibre_burnin", getattr(cfg, "FIBRE_BURNIN", 10000)))
+            fibre_node.inputs.jumps = int(getattr(cfg, "fibre_jumps", getattr(cfg, "FIBRE_JUMPS", 1250)))
+            fibre_node.inputs.sample_every = int(getattr(cfg, "fibre_sample_every", getattr(cfg, "FIBRE_SAMPLE_EVERY", 25)))
             wf.connect(fibre_deps, "out", fibre_node, "deps")
 
             xtract_node = pe.Node(Xtract(), name="xtract")
             xtract_node.inputs.outdir = xtract_out
-            xtract_node.inputs.stdref = cfg.std_ref_file
-            xtract_node.inputs.species = cfg.XTRACT_SPECIES
-            xtract_node.inputs.no_gpu = cfg.XTRACT_NO_GPU
-            xtract_node.inputs.ptx_steplength = cfg.XTRACT_PTX_STEPLEN
-            xtract_node.inputs.profiles_dir = cfg.XTRACT_PROFILES_DIR
+            xtract_node.inputs.mode = mode
+            xtract_node.inputs.stdref = getattr(cfg, "std_ref_file", None)
+            xtract_node.inputs.species = getattr(cfg, "xtract_species", getattr(cfg, "XTRACT_SPECIES", "CUSTOM"))
+            xtract_node.inputs.no_gpu = bool(getattr(cfg, "xtract_no_gpu", getattr(cfg, "XTRACT_NO_GPU", False)))
+            xtract_node.inputs.ptx_steplength = float(getattr(cfg, "xtract_ptx_steplength", getattr(cfg, "XTRACT_PTX_STEPLENGTH", 0.15)))
+            xtract_node.inputs.profiles_dir = getattr(cfg, "xtract_profiles_dir", getattr(cfg, "XTRACT_PROFILES_DIR", ""))
             wf.connect(fibre_node, "cudimot_dir", xtract_node, "cudimot_dir")
 
         else:
@@ -709,25 +698,25 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
 
             xtract_node = pe.Node(Xtract(), name="xtract")
             xtract_node.inputs.outdir = xtract_out
-            xtract_node.inputs.stdref = cfg.std_ref_file
-            xtract_node.inputs.species = cfg.XTRACT_SPECIES
-            xtract_node.inputs.no_gpu = cfg.XTRACT_NO_GPU
-            xtract_node.inputs.ptx_steplength = cfg.XTRACT_PTX_STEPLEN
-            xtract_node.inputs.profiles_dir = cfg.XTRACT_PROFILES_DIR
-
+            xtract_node.inputs.mode = mode
+            xtract_node.inputs.stdref = getattr(cfg, "std_ref_file", None)
+            xtract_node.inputs.species = getattr(cfg, "xtract_species", getattr(cfg, "XTRACT_SPECIES", "CUSTOM"))
+            xtract_node.inputs.no_gpu = bool(getattr(cfg, "xtract_no_gpu", getattr(cfg, "XTRACT_NO_GPU", False)))
+            xtract_node.inputs.ptx_steplength = float(getattr(cfg, "xtract_ptx_steplength", getattr(cfg, "XTRACT_PTX_STEPLENGTH", 0.15)))
+            xtract_node.inputs.profiles_dir = getattr(cfg, "xtract_profiles_dir", getattr(cfg, "XTRACT_PROFILES_DIR", ""))
             wf.connect(bpx_node, "bpx_dir", xtract_node, "bpx_dir")
 
         # Warps into XTRACT in FULL mode
-        if reg_method == "FNIRT":
-            wf.connect(nmt_reg, "warp_std2anat", xtract_node, "warp_std2anat")
-            wf.connect(nmt_reg, "warp_anat2std", xtract_node, "warp_anat2std")
+        if reg_method == "fnirt":
+            wf.connect(stdreg, "warp_std2anat", xtract_node, "warp_std2anat")
+            wf.connect(stdreg, "warp_anat2std", xtract_node, "warp_anat2std")
         else:
-            wf.connect(nmt_reg, "combined_warp_inv", xtract_node, "warp_std2anat")
-            wf.connect(nmt_reg, "combined_warp", xtract_node, "warp_anat2std")
+            wf.connect(stdreg, "combined_warp_inv", xtract_node, "warp_std2anat")
+            wf.connect(stdreg, "combined_warp", xtract_node, "warp_anat2std")
 
         # XTRACT viewer hook
         xtract_node.inputs.viewer_script = pkg_file("nodes", "tract_viewer.py")
-        xtract_node.inputs.do_viewer = bool(getattr(cfg, "DO_VIEWER", True))
+        xtract_node.inputs.do_viewer = bool(getattr(cfg, "do_viewer", True))
 
     # 12) QA report (always; tolerant of missing files)
     qa = pe.Node(QAReport(), name="qa_report")
@@ -740,8 +729,7 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
     qa.inputs.nipype_graph_preproc = graph_png
 
     qa.inputs.eddy_qc_json = os.path.join(eddy_root, "eddy.qc", "qc.json")
-    qa.inputs.nmt_mask_img = pkg_file("files", "NMT_v2.0_sym_05mm_LR_brainmask.nii.gz")
-    qa.inputs.nmt_fa_img = pkg_file("files", "NMT_v2.0_sym_05mm_FA.nii.gz")
+    qa.inputs.std_mask_img = getattr(cfg, "std_mask_file", None)  # generic standard outline mask
 
     # Diffusion inputs to QA
     qa.inputs.data_4d = os.path.join(eddy_root, "eddy.nii.gz")
@@ -763,10 +751,10 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
     wf.connect(dti_node, "fa_file", qa_deps, "in1")
 
     # Use known-present warp outputs just to enforce ordering
-    if reg_method == "FNIRT":
-        wf.connect(nmt_reg, "warp_anat2std", qa_deps, "in2")
+    if reg_method == "fnirt":
+        wf.connect(stdreg, "warp_anat2std", qa_deps, "in2")
     else:  # MMORF
-        wf.connect(nmt_reg, "combined_warp", qa_deps, "in2")
+        wf.connect(stdreg, "combined_warp", qa_deps, "in2")
 
     # Use eddy_prep's bvals_out (always there) to avoid fragile EddyRun outputs
     wf.connect(eddy_prep, "bvals_out", qa_deps, "in3")

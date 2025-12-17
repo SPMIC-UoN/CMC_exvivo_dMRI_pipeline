@@ -4,6 +4,7 @@
 import os
 import shlex
 import subprocess
+import shutil  # for shutil.which
 
 from nipype.interfaces.base import (
     BaseInterface,
@@ -14,19 +15,22 @@ from nipype.interfaces.base import (
     traits,
 )
 
-# Resolve FSL root once
+# ---------------------------------------------------------
+# FSL helpers
+# ---------------------------------------------------------
+
 def _fsl_root() -> str:
+    """Resolve FSLDIR once; fall back to inferring from flirt on PATH."""
     fsl = os.environ.get("FSLDIR")
     if fsl:
         return os.path.abspath(fsl)
-    # Fallback: try to infer from flirt location if present in PATH later
     return ""
 
 def _fsl_exe(name: str) -> str:
     root = _fsl_root()
     if root:
         return os.path.join(root, "bin", name)
-    return name  # hope PATH contains it
+    return name  # assume on PATH
 
 def _run_quiet(args: list[str]) -> None:
     try:
@@ -38,13 +42,13 @@ def _run_quiet(args: list[str]) -> None:
 
 
 # ======================================================================
-# FNIRT option
+# FNIRT option (FLIRT + FNIRT)
 # ======================================================================
 
 class Reg2StdFnirtInputSpec(BaseInterfaceInputSpec):
     fa     = File(exists=True,  mandatory=True, desc="Subject FA (DTIFIT)")
-    outdir = Directory(mandatory=True,        desc="Output directory (NMTreg)")
-    atl    = File(exists=True,  mandatory=True, desc="Template FA (NMT_FA.nii.gz)")
+    outdir = Directory(mandatory=True,        desc="Output directory (STDreg)")
+    atl    = File(exists=True,  mandatory=True, desc="Standard-space FA template")
 
 class Reg2StdFnirtOutputSpec(TraitedSpec):
     outdir        = Directory()
@@ -53,17 +57,18 @@ class Reg2StdFnirtOutputSpec(TraitedSpec):
     fa_in_std     = File()
 
 class Reg2Std(BaseInterface):
-    """Classic FLIRT+FNIRT wrapper: outputs match earlier pipeline expectations."""
+    """FLIRT (affine) + FNIRT (nonlinear) registration to standard FA."""
     input_spec  = Reg2StdFnirtInputSpec
     output_spec = Reg2StdFnirtOutputSpec
 
     def _outs(self):
         od = os.path.abspath(self.inputs.outdir)
+        # Keep stable, STD-prefixed filenames
         return (
             od,
             os.path.join(od, "stdreg_anat_to_std_warp.nii.gz"),
             os.path.join(od, "stdreg_std_to_anat_warp.nii.gz"),
-            os.path.join(od, "FA_in_NMT.nii.gz"),
+            os.path.join(od, "FA_in_STD.nii.gz"),
             os.path.join(od, "stdreg_anat_to_std.mat"),
             os.path.join(od, "stdreg_anat_to_std.nii.gz"),
         )
@@ -74,7 +79,7 @@ class Reg2Std(BaseInterface):
         od, warp_a2s, warp_s2a, fa_in_std, aff_mat, fa_lin = self._outs()
         os.makedirs(od, exist_ok=True)
 
-        # 1) Affine
+        # 1) Affine (FLIRT)
         _run_quiet([
             _fsl_exe("flirt"),
             "-in", fa, "-ref", reffa,
@@ -82,7 +87,7 @@ class Reg2Std(BaseInterface):
             "-out", fa_lin,
         ])
 
-        # 2) FNIRT non linear (anat->std)
+        # 2) Nonlinear (FNIRT) anat->std
         _run_quiet([
             _fsl_exe("fnirt"),
             f"--in={fa}",
@@ -92,7 +97,7 @@ class Reg2Std(BaseInterface):
             f"--iout={fa_in_std}",
         ])
 
-        # 3) Inverse
+        # 3) Invert warp (std->anat)
         _run_quiet([
             _fsl_exe("invwarp"),
             "-w", warp_a2s,
@@ -124,13 +129,13 @@ class MMORFInputSpec(BaseInterfaceInputSpec):
     fa     = File(exists=False, mandatory=True, desc="Subject FA (e.g., dti_FA.nii.gz)")
     tensor = File(exists=False, mandatory=True, desc="Subject tensor (e.g., dti_tensor.nii.gz)")
 
-    # References
-    std_ref_fa     = File(exists=True,  mandatory=True, desc="NMT FA template")
-    std_ref_tensor = File(exists=True,  mandatory=True, desc="NMT tensor template")
+    # References (provided by pipeline/config; species/template agnostic)
+    std_ref_fa     = File(exists=True,  mandatory=True, desc="Standard-space FA template")
+    std_ref_tensor = File(exists=True,  mandatory=True, desc="Standard-space tensor template")
 
     # Config template and output dir
     config_template = File(exists=True, mandatory=True, desc="mmorf_config_template.ini")
-    outdir          = Directory(mandatory=True, desc="Output directory (NMTreg)")
+    outdir          = Directory(mandatory=True, desc="Output directory (STDreg)")
 
     # Tool name (assumed on PATH or in FSLDIR/bin)
     mmorf = traits.Str("mmorf", usedefault=True)
@@ -142,7 +147,7 @@ class MMORFOutputSpec(TraitedSpec):
     mmorf_warp          = File()
     combined_warp       = File()
     combined_warp_inv   = File()
-    fa_in_nmt           = File()
+    fa_in_std           = File()
 
 
 class MMORFReg(BaseInterface):
@@ -183,10 +188,10 @@ class MMORFReg(BaseInterface):
         # Resolve subject and templates
         fa     = self._verify_file(self.inputs.fa, "subject FA")
         tensor = self._verify_file(self.inputs.tensor, "subject tensor")
-        std_fa = self._verify_file(self.inputs.std_ref_fa, "NMT FA template")
-        std_t  = self._verify_file(self.inputs.std_ref_tensor, "NMT tensor template")
+        std_fa = self._verify_file(self.inputs.std_ref_fa, "STD FA template")
+        std_t  = self._verify_file(self.inputs.std_ref_tensor, "STD tensor template")
 
-        # 1) Initial affine: FLIRT FA -> NMT FA
+        # 1) Initial affine: FLIRT FA -> STD FA
         affine_mat = os.path.join(out, "stdreg_anat_to_std.mat")
         lin_out    = os.path.join(out, "stdreg_anat_to_std")
         _run_quiet([
@@ -208,9 +213,6 @@ class MMORFReg(BaseInterface):
             flirt_path = shutil.which("flirt") or _fsl_exe("flirt")
             if flirt_path and "/bin/flirt" in flirt_path:
                 fsl_root = os.path.dirname(os.path.dirname(os.path.abspath(flirt_path)))
-        if not fsl_root:
-            # Last resort, leave as-is but warn by raising if template expects it
-            pass
 
         replacements = {
             "FSLDIR":              fsl_root or "FSLDIR",
@@ -232,7 +234,7 @@ class MMORFReg(BaseInterface):
         mmorf_warp = os.path.join(out, "mmorf_warp.nii.gz")
         _run_quiet([self.inputs.mmorf, "--config", cfg_dst, "--warp_out", mmorf_warp])
 
-        # 4) Combine affine and non linear warp to template
+        # 4) Combine affine and non-linear warp to STD
         combined_warp = os.path.join(out, "combined_warp.nii.gz")
         _run_quiet([
             _fsl_exe("convertwarp"),
@@ -242,14 +244,14 @@ class MMORFReg(BaseInterface):
             "-o", combined_warp,
         ])
 
-        # 5) Apply to FA to create QA output in template space
-        fa_in_nmt = os.path.join(out, "dti_FA_in_NMT.nii.gz")
+        # 5) Apply to FA to create QA output in standard space
+        fa_in_std = os.path.join(out, "fa_in_STD.nii.gz")
         _run_quiet([
             _fsl_exe("applywarp"),
             "-i", fa,
             "-r", std_fa,
             "-w", combined_warp,
-            "-o", fa_in_nmt,
+            "-o", fa_in_std,
         ])
 
         # 6) Inverse warp (std->anat)
@@ -267,7 +269,7 @@ class MMORFReg(BaseInterface):
         self._mmorf_warp        = mmorf_warp
         self._combined_warp     = combined_warp
         self._combined_warp_inv = combined_warp_inv
-        self._fa_in_nmt         = fa_in_nmt
+        self._fa_in_std         = fa_in_std
 
         return runtime
 
@@ -278,5 +280,5 @@ class MMORFReg(BaseInterface):
             "mmorf_warp":        getattr(self, "_mmorf_warp", ""),
             "combined_warp":     getattr(self, "_combined_warp", ""),
             "combined_warp_inv": getattr(self, "_combined_warp_inv", ""),
-            "fa_in_nmt":         getattr(self, "_fa_in_nmt", ""),
+            "fa_in_std":         getattr(self, "_fa_in_std", ""),
         }

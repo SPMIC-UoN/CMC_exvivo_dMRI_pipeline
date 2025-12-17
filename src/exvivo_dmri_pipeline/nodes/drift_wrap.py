@@ -1,51 +1,62 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# Standard lib
 import os
 
-# Third party
 from nipype.interfaces.base import (
     TraitedSpec, File, Directory, traits,
     CommandLine, CommandLineInputSpec, isdefined, InputMultiPath
 )
 
-# Local
 from ..utils import pkg_file
 
-class DriftInputSpec(CommandLineInputSpec):
-    # Script to run (our packaged drift.py)
-    script = File(exists=True, position=0, argstr="%s", mandatory=True)
 
-    # Accept one or many inputs; Nipype will coerce a single string into a list
+def _fsl_std_vent_path() -> str:
+    """Return FSL’s HUM ventricles mask if available."""
+    fsldir = os.environ.get("FSLDIR", "")
+    if not fsldir:
+        return ""
+    cand = os.path.join(fsldir, "data", "standard", "MNI152_T1_2mm_VentricleMask.nii.gz")
+    return cand if os.path.isfile(cand) else ""
+
+
+class DriftInputSpec(CommandLineInputSpec):
+    script = File(exists=True, position=0, argstr="%s", mandatory=True)
     input  = InputMultiPath(File(exists=True), argstr="-i %s",     mandatory=True, sep=" ")
     bvals  = InputMultiPath(File(exists=True), argstr="-bvals %s", mandatory=True, sep=" ")
 
     model  = traits.Enum("single", "linear", "quadratic", usedefault=True, argstr="-model %s")
     outdir = traits.Str(argstr="-outdir %s", usedefault=True, default_value="drift_analysis")
     output = traits.List(traits.Str, argstr="--output %s", sep=" ")
-
-    # Optional mask-based QC (ex vivo)
-    mask   = File(exists=True, argstr="--mask %s")
-    vent   = File(exists=True, argstr="--vent %s")
-    std    = File(exists=True, argstr="--std %s")
-
-    # Tools folder must contain reg2std.py; default to packaged nodes/ if not provided
+    
+    mask   = File(exists=True, argstr="--mask %s", desc="STD-space brain mask for QC")
+    vent   = File(exists=True, argstr="--vent %s", desc="STD-space ventricles mask for drift QC")
+    std    = File(exists=True, argstr="--std %s",  desc="STD-space reference image (e.g., HCP1065 FA or NMT FA)")
+    mode   = traits.Enum("hum", "nhp", argstr="--mode %s", mandatory=False, desc="Acquisition species mode")
     toolsdir = Directory(argstr="--toolsdir %s")
+
 
 class DriftOutputSpec(TraitedSpec):
     out_files = traits.List(File())
 
+
 class Drift(CommandLine):
+    """Thin wrapper around drift.py with explicit HUM/NHP handling for QC assets."""
     _cmd = "python3"
     input_spec  = DriftInputSpec
     output_spec = DriftOutputSpec
 
     def _run_interface(self, runtime):
-        # If user didn't provide toolsdir, point to packaged nodes/ (reg2std.py lives there)
+        # Default toolsdir to packaged nodes/ (where reg2std.py lives)
         if not isdefined(self.inputs.toolsdir) or not self.inputs.toolsdir:
             reg2std_path = pkg_file("nodes", "reg2std.py")
             self.inputs.toolsdir = os.path.dirname(reg2std_path)
+        if isdefined(self.inputs.mode) and str(self.inputs.mode).lower() == "hum":
+            if (not isdefined(self.inputs.vent)) or (not self.inputs.vent):
+                hum_vent = _fsl_std_vent_path()
+                if hum_vent:
+                    self.inputs.vent = hum_vent
+
         return super()._run_interface(runtime)
 
     def _list_outputs(self):

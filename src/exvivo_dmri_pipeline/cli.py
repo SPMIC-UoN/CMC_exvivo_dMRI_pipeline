@@ -130,12 +130,41 @@ def _check_full_inputs(cfg: Config) -> None:
         _require_files(sidecars, "SSFP sidecar files (TRs/diffGradAmps/diffGradDurs/flipAngles/flipMask/noisefloor)")
         _require_files(maps, "SSFP quantitative maps (T1map/T2map/B1map)")
 
-    # XTRACT profiles dir must exist (contains structureList)
-    profiles_dir = (cfg.XTRACT_PROFILES_DIR or "").strip()
-    if not profiles_dir or not os.path.isdir(profiles_dir) or not os.path.isfile(os.path.join(profiles_dir, "structureList")):
-        raise SystemExit(
-            "[cmc_exvivo_pipeline] XTRACT_PROFILES_DIR is missing or invalid — it must exist and contain 'structureList'."
-        )
+    # XTRACT logic
+    species = (cfg.xtract_species or "CUSTOM").strip().upper()
+    profiles_dir = (cfg.xtract_profiles_dir or "").strip()
+
+    # If user chooses CUSTOM species, they must point XTRACT at a profiles_dir
+    if species == "CUSTOM":
+        if not profiles_dir:
+            raise ValueError(
+                "[config] When xtract_species is 'CUSTOM', you must set xtract_profiles_dir "
+                "to a directory containing a 'structureList' file."
+            )
+
+        if not os.path.isdir(profiles_dir):
+            raise FileNotFoundError(
+                f"[config] xtract_profiles_dir does not exist: {profiles_dir}"
+            )
+
+        struct_list = os.path.join(profiles_dir, "structureList")
+        if not os.path.isfile(struct_list):
+            raise FileNotFoundError(
+                f"[config] structureList not found in xtract_profiles_dir: {struct_list}"
+            )
+
+    # For HUMAN or MACAQUE, profiles_dir is optional; if provided,
+    # we just validate that it exists + has structureList
+    elif profiles_dir:
+        if not os.path.isdir(profiles_dir):
+            raise FileNotFoundError(
+                f"[config] xtract_profiles_dir does not exist: {profiles_dir}"
+            )
+        struct_list = os.path.join(profiles_dir, "structureList")
+        if not os.path.isfile(struct_list):
+            raise FileNotFoundError(
+                f"[config] structureList not found in xtract_profiles_dir: {struct_list}"
+            )
 
     # Registration resources: basic templates/scripts must exist.
     if cfg.REG_METHOD.upper().strip() == "FNIRT":

@@ -26,6 +26,11 @@ def _absify(d: Dict[str, str]) -> Dict[str, str]:
             out[k] = _abs(v)
     return out
 
+def _lower_keys(d):
+    """Return a shallow copy of d with str keys lowercased."""
+    if not isinstance(d, dict):
+        return d
+    return { (k.lower() if isinstance(k, str) else k): v for k, v in d.items() }
 
 def _anykey(d: dict, key: str, default=None):
     if d is None:
@@ -177,29 +182,33 @@ class Config:
     def from_yaml(cls, path: str) -> "Config":
         with open(path, "r") as f:
             raw = yaml.safe_load(f) or {}
-        raw = { (k.lower() if isinstance(k, str) else k): v for k, v in raw.items() }
+        raw = _lower_keys(raw)
+        for nested in ("data_paths", "maps", "sidecars"):
+            if nested in raw and isinstance(raw[nested], dict):
+                raw[nested] = _lower_keys(raw[nested])
+
         import dataclasses
         allowed = {f.name for f in dataclasses.fields(cls)}
         unknown = [k for k in raw.keys() if isinstance(k, str) and k not in allowed]
         if unknown:
             print("[config] Warning: unknown config keys (ignored): " + ", ".join(sorted(unknown)))
-        
+
+        # normalise basic enums
         raw["acqtype"] = (raw.get("acqtype", "ssfp") or "ssfp").strip().lower()
-        raw["mode"]    = (raw.get("mode", "nhp") or "nhp").strip().lower()
+        raw["mode"]    = (raw.get("mode", "nhp")  or "nhp").strip().lower()
 
         cfg = cls(**raw)
         cfg.source_yaml = os.path.abspath(path)
         cfg._finalize()
         return cfg
-
-
+    
     @property
     def abs_dmri_root(self) -> str:
         return self.dmri_root
 
     def _finalize(self) -> None:
         # workspace
-        self.dmri_root = _abs(self.dmri_root or "./exvivo_proc")
+        self.dmri_root = _abs(self.dmri_root or "./proc")
 
         # acquisition type
         self.acqtype = (self.acqtype or "ssfp").strip().lower()

@@ -172,20 +172,26 @@ class Config:
 
     # hum/nhp mode (new)
     mode: str = "nhp"  # "nhp" or "hum"
-
+    
     @classmethod
     def from_yaml(cls, path: str) -> "Config":
         with open(path, "r") as f:
             raw = yaml.safe_load(f) or {}
-
-        # tolerate case-insensitive keys for these important entries
-        raw["acqtype"] = (_anykey(raw, "acqtype", "ssfp") or "ssfp").strip().lower()
-        raw["mode"]    = (_anykey(raw, "mode", "nhp") or "nhp").strip().lower()
+        raw = { (k.lower() if isinstance(k, str) else k): v for k, v in raw.items() }
+        import dataclasses
+        allowed = {f.name for f in dataclasses.fields(cls)}
+        unknown = [k for k in raw.keys() if isinstance(k, str) and k not in allowed]
+        if unknown:
+            print("[config] Warning: unknown config keys (ignored): " + ", ".join(sorted(unknown)))
+        
+        raw["acqtype"] = (raw.get("acqtype", "ssfp") or "ssfp").strip().lower()
+        raw["mode"]    = (raw.get("mode", "nhp") or "nhp").strip().lower()
 
         cfg = cls(**raw)
-        cfg.source_yaml = _abs(path)
+        cfg.source_yaml = os.path.abspath(path)
         cfg._finalize()
         return cfg
+
 
     @property
     def abs_dmri_root(self) -> str:

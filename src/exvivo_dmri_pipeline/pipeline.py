@@ -150,9 +150,9 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
     os.makedirs(sidecarsdir, exist_ok=True)
     os.makedirs(datadir, exist_ok=True)
     os.makedirs(denoise_dir, exist_ok=True)
-
+    
     acqtype = (getattr(cfg, "acqtype", "ssfp") or "ssfp").strip().lower()
-    mode = (getattr(cfg, "mode", "nhp") or "nhp").strip().lower()  # "nhp" | "hum"
+    mode = (getattr(cfg, "MODE", getattr(cfg, "mode", "nhp")) or "nhp").strip().lower()  # "nhp" | "hum"
 
     # Keep a copy of YAML used
     if getattr(cfg, "source_yaml", None) and os.path.isfile(cfg.source_yaml):
@@ -241,11 +241,18 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
             xtract_node = pe.Node(Xtract(), name="xtract")
             xtract_node.inputs.outdir = xtract_out
             xtract_node.inputs.mode = mode
-            xtract_node.inputs.stdref = getattr(cfg, "std_ref_file", None)
-            xtract_node.inputs.species = getattr(cfg, "xtract_species", getattr(cfg, "XTRACT_SPECIES", "CUSTOM"))
+            if mode == "hum":
+                xtract_node.inputs.stdref = getattr(cfg, "xtract_stdref_hum", None)
+            else:
+                xtract_node.inputs.stdref = getattr(cfg, "std_ref_file", None)
+            xtract_node.inputs.species = getattr(cfg, "xtract_species", getattr(cfg, "XTRACT_SPECIES", "CUSTOM"),)
+            xtract_node.inputs.mac_ext = getattr(cfg, "xtract_mac_ext", getattr(cfg, "xtract_mac_ext_default", "_NMT"),)
             xtract_node.inputs.no_gpu = bool(getattr(cfg, "xtract_no_gpu", getattr(cfg, "XTRACT_NO_GPU", False)))
-            xtract_node.inputs.ptx_steplength = float(getattr(cfg, "xtract_ptx_steplen", getattr(cfg, "XTRACT_PTX_STEPLEN", 0.15)))
-            xtract_node.inputs.profiles_dir = getattr(cfg, "xtract_profiles_dir", getattr(cfg, "XTRACT_PROFILES_DIR", ""))
+            xtract_node.inputs.ptx_steplength = float(getattr(cfg, "xtract_ptx_steplength", getattr(cfg, "XTRACT_PTX_STEPLENGTH", 0.15)))
+            xtract_node.inputs.profiles_dir = getattr(cfg, "xtract_profiles_dir", getattr(cfg, "XTRACT_PROFILES_DIR", ""),)
+            # Viewer
+            xtract_node.inputs.viewer_script = pkg_file("nodes", "tract_viewer.py")
+            xtract_node.inputs.do_viewer = cfg.DO_VIEWER
             wf.connect(fibre_node, "cudimot_dir", xtract_node, "cudimot_dir")
 
         else:
@@ -255,11 +262,18 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
             xtract_node = pe.Node(Xtract(), name="xtract")
             xtract_node.inputs.outdir = xtract_out
             xtract_node.inputs.mode = mode
-            xtract_node.inputs.stdref = getattr(cfg, "std_ref_file", None)
-            xtract_node.inputs.species = getattr(cfg, "xtract_species", getattr(cfg, "XTRACT_SPECIES", "CUSTOM"))
+            if mode == "hum":
+                xtract_node.inputs.stdref = getattr(cfg, "xtract_stdref_hum", None)
+            else:
+                xtract_node.inputs.stdref = getattr(cfg, "std_ref_file", None)
+            xtract_node.inputs.species = getattr(cfg, "xtract_species", getattr(cfg, "XTRACT_SPECIES", "CUSTOM"),)
+            xtract_node.inputs.mac_ext = getattr(cfg, "xtract_mac_ext", getattr(cfg, "xtract_mac_ext_default", "_NMT"),)
             xtract_node.inputs.no_gpu = bool(getattr(cfg, "xtract_no_gpu", getattr(cfg, "XTRACT_NO_GPU", False)))
-            xtract_node.inputs.ptx_steplength = float(getattr(cfg, "xtract_ptx_steplen", getattr(cfg, "XTRACT_PTX_STEPLEN", 0.15)))
-            xtract_node.inputs.profiles_dir = getattr(cfg, "xtract_profiles_dir", getattr(cfg, "XTRACT_PROFILES_DIR", ""))
+            xtract_node.inputs.ptx_steplength = float(getattr(cfg, "xtract_ptx_steplength", getattr(cfg, "XTRACT_PTX_STEPLENGTH", 0.15)))
+            xtract_node.inputs.profiles_dir = getattr(cfg, "xtract_profiles_dir", getattr(cfg, "XTRACT_PROFILES_DIR", ""),)
+            # Viewer
+            xtract_node.inputs.viewer_script = pkg_file("nodes", "tract_viewer.py")
+            xtract_node.inputs.do_viewer = cfg.DO_VIEWER
             wf.connect(bpx_node, "bpx_dir", xtract_node, "bpx_dir")
 
         # Warps into XTRACT
@@ -319,13 +333,13 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
         sc_node = pe.Node(CopyExVivoSidecars(), name="copy_sidecars")
         sc_node.inputs.bvals = cfg.data_paths.get("bvals", "")
         sc_node.inputs.bvecs = cfg.data_paths.get("bvecs", "")
-        sc_node.inputs.TRs = cfg.sidecars.get("TRs", "")
-        sc_node.inputs.diffGradAmps = cfg.sidecars.get("diffGradAmps", "")
-        sc_node.inputs.diffGradDurs = cfg.sidecars.get("diffGradDurs", "")
-        sc_node.inputs.flipAngles = cfg.sidecars.get("flipAngles", "")
-        sc_node.inputs.flipMask = cfg.sidecars.get("flipMask", "")
-        sc_node.inputs.noisefloor = cfg.sidecars.get("noisefloor", "")
-        sc_node.inputs.whichshell = cfg.sidecars.get("whichshell", "")
+        sc_node.inputs.TRs          = cfg.sidecars.get("trs", "")
+        sc_node.inputs.diffGradAmps = cfg.sidecars.get("diffgradamps", "")
+        sc_node.inputs.diffGradDurs = cfg.sidecars.get("diffgraddurs", "")
+        sc_node.inputs.flipAngles   = cfg.sidecars.get("flipangles", "")
+        sc_node.inputs.flipMask     = cfg.sidecars.get("flipmask", "")
+        sc_node.inputs.noisefloor   = cfg.sidecars.get("noisefloor", "")
+        sc_node.inputs.whichshell   = cfg.sidecars.get("whichshell", "")
         sc_node.inputs.outdir = sidecarsdir
         grads_src = sc_node
     else:
@@ -361,9 +375,9 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
     if acqtype == "ssfp":
         img_node = pe.Node(CopyImagesToRaw(), name="copy_images")
         img_node.inputs.data_nii = cfg.data_paths["data_nii"]
-        img_node.inputs.T1map = cfg.maps["T1map"]
-        img_node.inputs.T2map = cfg.maps["T2map"]
-        img_node.inputs.B1map = cfg.maps["B1map"]
+        img_node.inputs.T1map = cfg.maps["t1map"]
+        img_node.inputs.T2map = cfg.maps["t2map"]
+        img_node.inputs.B1map = cfg.maps["b1map"]
         img_node.inputs.outdir = data_rawdir
         if getattr(cfg, "brain_mask", None) and os.path.isfile(cfg.brain_mask):
             img_node.inputs.brain_mask = cfg.brain_mask
@@ -477,6 +491,7 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
     drift_node.inputs.mask = getattr(cfg, "std_mask_file", None)
     drift_node.inputs.vent = getattr(cfg, "std_ventricles_file", None)
     drift_node.inputs.std = getattr(cfg, "std_ref_file", None)
+    drift_node.inputs.mode = mode
     wf.connect(gibbs_node, "out_file", drift_node, "input")
     wf.connect(grads_src, "bvals_file", drift_node, "bvals")
 
@@ -610,34 +625,16 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
 
     # 10) Registration to STD (FNIRT or MMORF)
     reg_method = (getattr(cfg, "reg_method", None) or getattr(cfg, "REG_METHOD", "FNIRT")).strip().lower()
-
     if reg_method == "fnirt":
-        reg2std_py = _resolve_first_existing(
-            [
-                getattr(cfg, "reg2std_py", None) or getattr(cfg, "REG2STD_PY", None),
-                os.path.join(NODES_DIR, "reg2std.py"),
-                os.path.join(FILES_DIR, "reg2std.py"),
-            ]
-        )
-        if not reg2std_py:
-            raise FileNotFoundError("[FNIRT] Could not locate reg2std.py.")
-        # FNIRT registration target: always use cfg.std_fa_file
         std_atl_fa = getattr(cfg, "std_fa_file", None)
         if not (std_atl_fa and os.path.isfile(std_atl_fa)):
-            raise FileNotFoundError(f"[FNIRT] Missing standard FA template (std_fa_file): {std_atl_fa}")
-
-        if not std_atl_fa:
-            raise FileNotFoundError("[FNIRT] Could not locate standard FA template (std_ref_file).")
-
+            raise FileNotFoundError(
+                f"[FNIRT] Missing standard FA template (std_fa_file): {std_atl_fa}"
+            )
         stdreg = pe.Node(Reg2Std(), name="reg2std")
-        stdreg.inputs.script = reg2std_py
-        stdreg.inputs.atl = std_atl_fa
+        stdreg.inputs.atl    = std_atl_fa
         stdreg.inputs.outdir = stdreg_dir
-        regcfg = getattr(cfg, "reg2std_config", None) or getattr(cfg, "REG2STD_CONFIG", None)
-        if regcfg and os.path.isfile(regcfg):
-            stdreg.inputs.config = regcfg
         wf.connect(dti_node, "fa_file", stdreg, "fa")
-
     elif reg_method == "mmorf":
         # MMORF registration targets: use cfg.std_* targets (mode-aware defaults set in Config)
         std_fa = getattr(cfg, "std_fa_file", None)
@@ -652,6 +649,7 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
         stdreg.inputs.std_ref_fa = std_fa
         stdreg.inputs.std_ref_tensor = std_tn
         stdreg.inputs.config_template = cfg_tpl
+        stdreg.inputs.mode = mode
         wf.connect(dti_node, "fa_file", stdreg, "fa")
         wf.connect(dti_node, "tensor_file", stdreg, "tensor")
     else:
@@ -684,11 +682,18 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
             xtract_node = pe.Node(Xtract(), name="xtract")
             xtract_node.inputs.outdir = xtract_out
             xtract_node.inputs.mode = mode
-            xtract_node.inputs.stdref = getattr(cfg, "std_ref_file", None)
-            xtract_node.inputs.species = getattr(cfg, "xtract_species", getattr(cfg, "XTRACT_SPECIES", "CUSTOM"))
+            if mode == "hum":
+                xtract_node.inputs.stdref = getattr(cfg, "xtract_stdref_hum", None)
+            else:
+                xtract_node.inputs.stdref = getattr(cfg, "std_ref_file", None)
+            xtract_node.inputs.species = getattr(cfg, "xtract_species", getattr(cfg, "XTRACT_SPECIES", "CUSTOM"),)
+            xtract_node.inputs.mac_ext = getattr(cfg, "xtract_mac_ext", getattr(cfg, "xtract_mac_ext_default", "_NMT"),)
             xtract_node.inputs.no_gpu = bool(getattr(cfg, "xtract_no_gpu", getattr(cfg, "XTRACT_NO_GPU", False)))
             xtract_node.inputs.ptx_steplength = float(getattr(cfg, "xtract_ptx_steplength", getattr(cfg, "XTRACT_PTX_STEPLENGTH", 0.15)))
-            xtract_node.inputs.profiles_dir = getattr(cfg, "xtract_profiles_dir", getattr(cfg, "XTRACT_PROFILES_DIR", ""))
+            xtract_node.inputs.profiles_dir = getattr(cfg, "xtract_profiles_dir", getattr(cfg, "XTRACT_PROFILES_DIR", ""),)
+            # Viewer
+            xtract_node.inputs.viewer_script = pkg_file("nodes", "tract_viewer.py")
+            xtract_node.inputs.do_viewer = cfg.DO_VIEWER
             wf.connect(fibre_node, "cudimot_dir", xtract_node, "cudimot_dir")
 
         else:
@@ -699,11 +704,18 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
             xtract_node = pe.Node(Xtract(), name="xtract")
             xtract_node.inputs.outdir = xtract_out
             xtract_node.inputs.mode = mode
-            xtract_node.inputs.stdref = getattr(cfg, "std_ref_file", None)
-            xtract_node.inputs.species = getattr(cfg, "xtract_species", getattr(cfg, "XTRACT_SPECIES", "CUSTOM"))
+            if mode == "hum":
+                xtract_node.inputs.stdref = getattr(cfg, "xtract_stdref_hum", None)
+            else:
+                xtract_node.inputs.stdref = getattr(cfg, "std_ref_file", None)
+            xtract_node.inputs.species = getattr(cfg, "xtract_species", getattr(cfg, "XTRACT_SPECIES", "CUSTOM"),)
+            xtract_node.inputs.mac_ext = getattr(cfg, "xtract_mac_ext", getattr(cfg, "xtract_mac_ext_default", "_NMT"),)
             xtract_node.inputs.no_gpu = bool(getattr(cfg, "xtract_no_gpu", getattr(cfg, "XTRACT_NO_GPU", False)))
             xtract_node.inputs.ptx_steplength = float(getattr(cfg, "xtract_ptx_steplength", getattr(cfg, "XTRACT_PTX_STEPLENGTH", 0.15)))
-            xtract_node.inputs.profiles_dir = getattr(cfg, "xtract_profiles_dir", getattr(cfg, "XTRACT_PROFILES_DIR", ""))
+            xtract_node.inputs.profiles_dir = getattr(cfg, "xtract_profiles_dir", getattr(cfg, "XTRACT_PROFILES_DIR", ""),)
+            # Viewer
+            xtract_node.inputs.viewer_script = pkg_file("nodes", "tract_viewer.py")
+            xtract_node.inputs.do_viewer = cfg.DO_VIEWER
             wf.connect(bpx_node, "bpx_dir", xtract_node, "bpx_dir")
 
         # Warps into XTRACT in FULL mode

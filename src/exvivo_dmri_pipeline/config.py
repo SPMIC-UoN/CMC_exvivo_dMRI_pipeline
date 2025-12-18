@@ -1,9 +1,6 @@
 # src/exvivo_dmri_pipeline/config.py
-from __future__ import annotations
-
 import os
-from dataclasses import dataclass, field
-from typing import Optional, Dict
+from typing import Any, Dict, Optional
 
 import yaml
 
@@ -13,398 +10,340 @@ from .utils import pkg_file
 # -----------------------------
 # helpers
 # -----------------------------
-def _abs(p: Optional[str]) -> Optional[str]:
+def _abspath(p: Optional[str]) -> Optional[str]:
+    if p is None:
+        return None
+    p = str(p)
     if not p:
         return None
     return os.path.abspath(os.path.expanduser(p))
 
 
-def _absify(d: Dict[str, str]) -> Dict[str, str]:
+def _abspath_dict(d: Optional[Dict[str, Any]]) -> Dict[str, str]:
     out: Dict[str, str] = {}
     for k, v in (d or {}).items():
         if v:
-            out[k] = _abs(v)
+            out[k] = _abspath(str(v))
     return out
 
-def _lower_keys(d):
-    """Return a shallow copy of d with str keys lowercased."""
-    if not isinstance(d, dict):
-        return d
-    return { (k.lower() if isinstance(k, str) else k): v for k, v in d.items() }
 
-def _anykey(d: dict, key: str, default=None):
-    if d is None:
-        return default
-    lc = key.lower()
-    for k, v in d.items():
-        if isinstance(k, str) and k.lower() == lc:
-            return v
-    return default
-
-
-def _abs_or_none(p: Optional[str]) -> Optional[str]:
-    if p and os.path.isfile(p):
-        return os.path.abspath(p)
-    return _abs(p)
+def _lower_keys(d: Dict[str, Any]) -> Dict[str, Any]:
+    return {str(k).lower(): v for k, v in d.items()}
 
 
 # -----------------------------
 # config
 # -----------------------------
-@dataclass
 class Config:
     """
-    Central configuration for the ex vivo dMRI pipeline.
+    Central configuration for the ex vivo pipeline, loaded from YAML.
 
     Modes:
-      ssfp:
-        Requires data_nii, bvals, bvecs
-        Requires sidecars: TRs, diffGradAmps, diffGradDurs, flipAngles, flipMask, noisefloor
-        Optional sidecar: whichshell
-        Requires maps: T1map, T2map, B1map
+      acqtype = "ssfp":
+        - Requires: data_nii, bvals, bvecs
+        - Requires sidecars: TRs, diffGradAmps, diffGradDurs, flipAngles, flipMask, noisefloor
+          (optionally whichshell)
+        - Requires maps: T1map, T2map, B1map
 
-      se:
-        Requires data_nii, bvals, bvecs
-        Optional brain_mask
-
-    Denoising:
-      Optional (run_denoise = False by default).
-      If enabled and both magnitude + phase are present -> complex-domain denoise.
-      If enabled and only magnitude present -> magnitude denoise.
-      Expects a shell wrapper (denoise_sh) compatible with nodes/denoise.py.
+      acqtype = "se":
+        - Requires: data_nii, bvals, bvecs
+        - Sidecars/maps optional
     """
 
-    # acquisition type
-    acqtype: str = "ssfp"  # "ssfp" or "se"
+    def __init__(self, y: Dict[str, Any]) -> None:
+        # Normalise top-level keys
+        y = _lower_keys(y or {})
 
-    # optional single folder with standard filenames
-    input_dir: Optional[str] = None
+        # -----------------------------
+        # core mode fields
+        # -----------------------------
+        acq_raw = str(y.get("acqtype", "ssfp") or "ssfp").strip().lower()
+        if acq_raw not in {"ssfp", "se"}:
+            raise RuntimeError("acqtype must be 'ssfp' or 'se'.")
+        self.acqtype: str = acq_raw
 
-    # explicit paths
-    data_paths: Dict[str, str] = field(default_factory=dict)   # keys: data_nii, bvals, bvecs, optional data_phase
-    maps: Dict[str, str]       = field(default_factory=dict)   # keys: T1map, T2map, B1map
-    sidecars: Dict[str, str]   = field(default_factory=dict)   # TRs, diffGradAmps, diffGradDurs, flipAngles, flipMask, noisefloor, optional whichshell
+        mode_raw = str(y.get("mode", "nhp") or "nhp").strip().lower()
+        if mode_raw not in {"nhp", "hum"}:
+            raise RuntimeError("mode must be 'nhp' or 'hum'.")
+        self.MODE: str = mode_raw
+        # also keep a lower-case alias for convenience / backwards compatibility
+        self.mode: str = mode_raw
 
-    brain_mask: Optional[str] = None
-    dmri_root: Optional[str]  = None
+        # -----------------------------
+        # workspace roots
+        # -----------------------------
+        self.dmri_root: str = y.get("dmri_root", "./proc")
+        self.abs_dmri_root: str = _abspath(self.dmri_root) or os.path.abspath("./proc")
+        self.proc_root: str = self.abs_dmri_root
 
-    # runtime toggles
-    no_gpu: bool = False
-    brain_mask_thr: float = 50.0
-    run_gibbs: bool = True
-    use_docker: bool = True
-    container_runtime: str = "docker"
-    interactive_tty: bool = True
-    gibbs_image: str = "docker.io/mrtrix3/mrtrix3:3.0.7"
+        self.input_dir: Optional[str] = _abspath(y.get("input_dir"))
 
-    run_eddy: bool = True
-    run_eddy_qc: bool = True
-    eddy_echo_sec: Optional[float] = None
+        # brain mask (optional; special strings treated as "none")
+        brain_mask_raw = y.get("brain_mask")
+        if isinstance(brain_mask_raw, str) and brain_mask_raw.strip().lower() in {
+            "", "none", "null", "na", "nil"
+        }:
+            brain_mask_raw = None
+        self.brain_mask: Optional[str] = _abspath(brain_mask_raw)
 
-    run_spatial_drift: bool = True
+        # -----------------------------
+        # data / maps / sidecars
+        # -----------------------------
+        data_paths_raw = y.get("data_paths") or {}
+        maps_raw = y.get("maps") or {}
+        sidecars_raw = y.get("sidecars") or {}
 
-    # drift + standard references
-    drift_py: Optional[str] = None
-    std_mask_file: Optional[str] = None
-    std_ventricles_file: Optional[str] = None
-    std_ref_file: Optional[str] = None
+        if isinstance(data_paths_raw, dict):
+            data_paths_raw = _lower_keys(data_paths_raw)
+        if isinstance(maps_raw, dict):
+            maps_raw = _lower_keys(maps_raw)
+        if isinstance(sidecars_raw, dict):
+            sidecars_raw = _lower_keys(sidecars_raw)
 
-    # source yaml (filled in from loader)
-    source_yaml: Optional[str] = None
-
-    # DTI / CUDIMOT (QA tensor)
-    dti_approx_b: int = 1000
-    dti_db: int = 60
-    dti_b0: int = 0
-
-    # CUDIMOT DTI
-    cudimot_cmd: str = "Pipeline_DTI_SSFP.sh"
-    cudimot_queue: Optional[str] = None
-    cudimot_njobs: int = 4
-    cudimot_run_mcmc: bool = True
-    cudimot_no_levmar: bool = True
-    cudimot_burnin: int = 10000
-    cudimot_jumps: int = 1250
-    cudimot_sample_every: int = 25
-
-    # registration (node chooses FNIRT or MMORF)
-    reg_method: str = "FNIRT"
-    reg2std_py: Optional[str] = None
-    reg2std_config: Optional[str] = None
-
-    # standard-space references for registration
-    # for nhp we default to packaged NMT_* files; for hum we default to HCP1065 FA/tensor
-    std_fa_file: Optional[str] = None
-    std_tensor_file: Optional[str] = None
-
-    # packaged NMT fallbacks (still exposed to allow override)
-    nmt_fa_file: Optional[str] = None
-    nmt_tensor_file: Optional[str] = None
-
-    # mmorf ini template and multi-scale knobs
-    mmorf_config_template: Optional[str] = None
-    mmorf_warp_res_init: str = "16"
-    mmorf_fwhm_set: str = "4.0 4.0 2.0 1.0 0.5 0.25 0.125"
-
-    # fibre modelling
-    fibre_pipeline_cmd: str = "Pipeline_Ball_3_Sticks_2Shells_SSFP.sh"
-    fibre_init_method: str = ""
-    fibre_queue: str = ""
-    fibre_njobs: int = 4
-    fibre_run_mcmc: bool = True
-    fibre_no_levmar: bool = True
-    fibre_burnin: int = 10000
-    fibre_jumps: int = 1250
-    fibre_sample_every: int = 25
-    fibre_subject_dir: str = ""
-
-    # XTRACT
-    xtract_species: str = "CUSTOM"  # user override; falls back to *_default
-    xtract_no_gpu: bool = False
-    xtract_ptx_steplength: float = 0.15
-    xtract_profiles_dir: str = ""
-
-    # Default-by-mode knobs
-    xtract_species_default: str = ""     # set in _finalize by mode
-    xtract_mac_ext_default: str = ""     # set in _finalize by mode
-    xtract_stdref_hum: Optional[str] = None  # MNI T1 1mm for human when profiles used
-
-    # denoising
-    run_denoise: bool = False
-    denoise_sh: Optional[str] = None      # path to wrapper script (bash)
-    denoise_method: str = "NORDIC"        # passed as -meth
-    denoise_name: str = "data"            # output stem name
-
-    # hum/nhp mode (new)
-    mode: str = "nhp"  # "nhp" or "hum"
-    
-    @classmethod
-    def from_yaml(cls, path: str) -> "Config":
-        with open(path, "r") as f:
-            raw = yaml.safe_load(f) or {}
-        raw = _lower_keys(raw)
-        for nested in ("data_paths", "maps", "sidecars"):
-            if nested in raw and isinstance(raw[nested], dict):
-                raw[nested] = _lower_keys(raw[nested])
-
-        import dataclasses
-        allowed = {f.name for f in dataclasses.fields(cls)}
-        unknown = [k for k in raw.keys() if isinstance(k, str) and k not in allowed]
-        if unknown:
-            print("[config] Warning: unknown config keys (ignored): " + ", ".join(sorted(unknown)))
-
-        # normalise basic enums
-        raw["acqtype"] = (raw.get("acqtype", "ssfp") or "ssfp").strip().lower()
-        raw["mode"]    = (raw.get("mode", "nhp")  or "nhp").strip().lower()
-
-        cfg = cls(**raw)
-        cfg.source_yaml = os.path.abspath(path)
-        cfg._finalize()
-        return cfg
-    
-    @property
-    def abs_dmri_root(self) -> str:
-        return self.dmri_root
-
-    def _finalize(self) -> None:
-        # workspace
-        self.dmri_root = _abs(self.dmri_root or "./proc")
-
-        # acquisition type
-        self.acqtype = (self.acqtype or "ssfp").strip().lower()
-        if self.acqtype not in ("ssfp", "se"):
-            raise ValueError("acqtype must be 'ssfp' or 'se'.")
-
-        # optional brain mask normalization
-        if isinstance(self.brain_mask, str) and self.brain_mask.strip().lower() in {"", "none", "null", "nil", "na"}:
-            self.brain_mask = None
-
-        # packaged defaults
-        self.drift_py = _abs(self.drift_py or pkg_file("nodes", "drift.py"))
-        # std_mask_file and std_ventricles_file will be set by mode below if not set
-
-        # allow single-folder inference if explicit paths not provided
-        if self.input_dir and not (self.data_paths or self.maps or self.sidecars):
-            root = _abs(self.input_dir)
+        # If a single input_dir is provided and no explicit data/maps/sidecars,
+        # assume standard filenames in that directory.
+        if self.input_dir and not data_paths_raw and not maps_raw and not sidecars_raw:
+            root = self.input_dir
 
             def P(name: str) -> str:
                 return os.path.join(root, name)
 
-            self.data_paths = {
+            data_paths_raw = {
                 "data_nii": P("data.nii.gz"),
                 "bvals": P("bvals"),
                 "bvecs": P("bvecs"),
             }
-            # optional phase
-            phase_cand = P("data_ph.nii.gz")
-            if os.path.isfile(phase_cand):
-                self.data_paths["data_phase"] = phase_cand
+            phase_candidate = P("data_ph.nii.gz")
+            if os.path.isfile(phase_candidate):
+                data_paths_raw["data_phase"] = phase_candidate
 
-            # SSFP maps
-            self.maps = {
-                "T1map": P("T1map.nii.gz"),
-                "T2map": P("T2map.nii.gz"),
-                "B1map": P("B1map.nii.gz"),
-            }
+            if self.acqtype == "ssfp":
+                maps_raw = {
+                    "t1map": P("T1map.nii.gz"),
+                    "t2map": P("T2map.nii.gz"),
+                    "b1map": P("B1map.nii.gz"),
+                }
+                sidecars_raw = {
+                    "trs": P("TRs"),
+                    "diffgradamps": P("diffGradAmps"),
+                    "diffgraddurs": P("diffGradDurs"),
+                    "flipangles": P("flipAngles"),
+                    "flipmask": P("flipMask"),
+                    "noisefloor": P("noisefloor"),
+                    "whichshell": P("whichshell"),
+                }
 
-            # sidecars (no TE)
-            self.sidecars = {
-                "TRs": P("TRs"),
-                "diffGradAmps": P("diffGradAmps"),
-                "diffGradDurs": P("diffGradDurs"),
-                "flipAngles": P("flipAngles"),
-                "flipMask": P("flipMask"),
-                "noisefloor": P("noisefloor"),
-                "whichshell": P("whichshell"),
-            }
+        self.data_paths: Dict[str, str] = _abspath_dict(data_paths_raw)
+        self.maps: Dict[str, str] = _abspath_dict(maps_raw)
+        self.sidecars: Dict[str, str] = _abspath_dict(sidecars_raw)
 
-        # absolutize
-        self.data_paths = _absify(self.data_paths)
-        self.maps       = _absify(self.maps)
-        self.sidecars   = _absify(self.sidecars)
-        self.brain_mask = _abs(self.brain_mask)
-
-        # validate required inputs
-        def _need(d: Dict[str, str], key: str):
+        # Validate core diffusion inputs
+        def _need(d: Dict[str, str], key: str, label: str) -> None:
             p = d.get(key)
             if not p or not os.path.isfile(p):
-                raise FileNotFoundError(f"Missing required '{key}': {p}")
+                raise FileNotFoundError(f"Missing required {label} '{key}': {p}")
 
         for k in ("data_nii", "bvals", "bvecs"):
-            _need(self.data_paths, k)
+            _need(self.data_paths, k, "data_paths")
 
         if self.acqtype == "ssfp":
-            for k in ("T1map", "T2map", "B1map"):
-                _need(self.maps, k)
+            # SSFP maps
+            for k in ("t1map", "t2map", "b1map"):
+                _need(self.maps, k, "maps")
 
-            for k in ("TRs", "diffGradAmps", "diffGradDurs", "flipAngles", "flipMask", "noisefloor"):
-                _need(self.sidecars, k)
+            # Required sidecars (whichshell is optional but must exist if provided)
+            for k in ("trs", "diffgradamps", "diffgraddurs", "flipangles", "flipmask", "noisefloor"):
+                _need(self.sidecars, k, "sidecars")
 
-            if self.sidecars.get("whichshell"):
-                _need(self.sidecars, "whichshell")
-        else:
-            # se: maps and sidecars not required
-            self.maps = self.maps or {}
-            self.sidecars = self.sidecars or {}
-
-        # eddy echo spacing must be supplied if eddy or eddy_qc are enabled
-        if (self.run_eddy or self.run_eddy_qc) and (self.eddy_echo_sec is None):
-            raise ValueError("eddy_echo_sec must be set (seconds) when run_eddy or run_eddy_qc is True.")
-
-        # normalize strings
-        self.container_runtime = (self.container_runtime or "docker").strip()
-        self.gibbs_image = self.gibbs_image or "docker.io/mrtrix3/mrtrix3:3.0.7"
-
-        # registration method
-        if self.reg_method.upper().strip() not in ("FNIRT", "MMORF"):
-            raise ValueError("reg_method must be 'FNIRT' or 'MMORF'.")
-
-        # reg2std script for fnirt path
-        if self.reg2std_py:
-            self.reg2std_py = _abs(self.reg2std_py)
-        else:
-            cand = pkg_file("nodes", "reg2std.py")
-            self.reg2std_py = _abs(cand) if os.path.isfile(cand) else None
-            if self.reg_method.upper().strip() == "FNIRT" and not self.reg2std_py:
-                raise FileNotFoundError("reg2std_py must be provided for FNIRT registration.")
-
-        if self.reg2std_config:
-            self.reg2std_config = _abs(self.reg2std_config)
-
-        # packaged NMT fallbacks (for nhp)
-        self.nmt_fa_file = _abs_or_none(self.nmt_fa_file or pkg_file("files", "NMT_FA.nii.gz"))
-        self.nmt_tensor_file = _abs_or_none(self.nmt_tensor_file or pkg_file("files", "NMT_tensor.nii.gz"))
-        self.mmorf_config_template = _abs_or_none(self.mmorf_config_template or pkg_file("files", "mmorf_config_template.ini"))
+            if "whichshell" in self.sidecars:
+                _need(self.sidecars, "whichshell", "sidecars")
 
         # -----------------------------
-        # hum/nhp mode-specific setup
+        # runtime toggles / eddy
         # -----------------------------
-        self.mode = (self.mode or "nhp").strip().lower()
-        if self.mode not in {"nhp", "hum"}:
-            raise ValueError("mode must be 'nhp' or 'hum'.")
+        self.no_gpu: bool = bool(y.get("no_gpu", False))
+        self.NO_GPU: bool = self.no_gpu  # compatibility
 
-        fsldir = os.environ.get("FSLDIR", "")
-        std_dir = os.path.join(fsldir, "data", "standard") if fsldir else ""
+        self.run_gibbs: bool = bool(y.get("run_gibbs", True))
+        self.use_docker: bool = bool(y.get("use_docker", True))
+        self.container_runtime: str = str(y.get("container_runtime", "docker"))
+        self.interactive_tty: bool = bool(y.get("interactive_tty", True))
+        self.gibbs_image: str = str(y.get("gibbs_image", "docker.io/mrtrix3/mrtrix3:3.0.7"))
 
-        hcp_fa     = os.path.join(std_dir, "FSL_HCP1065_FA_1mm.nii.gz") if std_dir else None
-        hcp_tensor = os.path.join(std_dir, "FSL_HCP1065_tensor_1mm.nii.gz") if std_dir else None
-        mni_t1_1mm = os.path.join(std_dir, "MNI152_T1_1mm.nii.gz") if std_dir else None
-        mni_vent   = os.path.join(std_dir, "MNI152_T1_2mm_VentricleMask.nii.gz") if std_dir else None
+        self.run_eddy: bool = bool(y.get("run_eddy", True))
+        self.run_eddy_qc: bool = bool(y.get("run_eddy_qc", True))
+        self.eddy_echo_sec = y.get("eddy_echo_sec")
 
-        if self.mode == "hum":
-            # Registration targets
-            self.std_fa_file     = _abs(self.std_fa_file     or hcp_fa)
-            self.std_tensor_file = _abs(self.std_tensor_file or hcp_tensor)
-
-            # Signal drift (ventricle) + reference
-            self.std_ventricles_file = _abs(self.std_ventricles_file or mni_vent)
-            self.std_ref_file        = _abs(self.std_ref_file or self.std_fa_file)
-
-            # XTRACT defaults like in vivo
-            self.xtract_species_default  = "HUMAN"
-            self.xtract_mac_ext_default  = ""
-            self.xtract_stdref_hum       = _abs(mni_t1_1mm)
-
-            # MMORF multiscale defaults
-            self.mmorf_warp_res_init = "64"
-            self.mmorf_fwhm_set      = "16.0 16.0 8.0 4.0 2.0 1.0 0.5"
-
-        else:  # nhp
-            # Registration targets default to packaged NMT
-            self.std_fa_file     = _abs(self.std_fa_file     or self.nmt_fa_file)
-            self.std_tensor_file = _abs(self.std_tensor_file or self.nmt_tensor_file)
-
-            # Signal drift ventricles + reference (packaged NMT)
-            self.std_ventricles_file = _abs(
-                self.std_ventricles_file or pkg_file("files", "NMT_v2.0_sym_05mm_ventricles.nii.gz")
+        if (self.run_eddy or self.run_eddy_qc) and self.eddy_echo_sec is None:
+            raise RuntimeError(
+                "eddy_echo_sec must be set (seconds) when run_eddy or run_eddy_qc is True."
             )
-            self.std_ref_file = _abs(self.std_ref_file or self.std_fa_file)
+        if self.eddy_echo_sec is not None:
+            self.eddy_echo_sec = float(self.eddy_echo_sec)
 
-            # XTRACT defaults like in vivo (macaque path)
-            self.xtract_species_default  = "MACAQUE"
-            self.xtract_mac_ext_default  = "_NMT"
-            self.xtract_stdref_hum       = None  # not used for nhp
+        self.run_spatial_drift: bool = bool(y.get("run_spatial_drift", True))
+        self.brain_mask_thr: float = float(y.get("brain_mask_thr", 50.0))
 
-            # MMORF multiscale defaults
-            self.mmorf_warp_res_init = "16"
-            self.mmorf_fwhm_set      = "4.0 4.0 2.0 1.0 0.5 0.25 0.125"
+        # -----------------------------
+        # DTI / CUDIMOT settings
+        # -----------------------------
+        self.dti_approx_b: int = int(y.get("dti_approx_b", 1000))
+        self.dti_db: int = int(y.get("dti_db", 60))
+        self.dti_b0: int = int(y.get("dti_b0", 0))
 
-        # --- XTRACT user override logic ---
-        # If user supplied an explicit species, keep it; otherwise adopt mode default
-        self.xtract_species = (self.xtract_species or self.xtract_species_default).strip().upper()
+        # Script names for CUDIMOT DTI and fibre models
+        # These are the ones you asked to keep explicitly in config.
+        self.dti_pipeline_cmd: str = str(y.get("dti_pipeline_cmd", y.get("cudimot_cmd", "Pipeline_DTI_SSFP.sh")))
+        self.cudimot_cmd: str = self.dti_pipeline_cmd  # alias
 
-        # Profiles directory
-        self.xtract_profiles_dir = _abs(self.xtract_profiles_dir or "")
-        self.xtract_mac_ext_default = self.xtract_mac_ext_default
-        
-        # fibre defaults normalization
-        self.fibre_pipeline_cmd = (self.fibre_pipeline_cmd or "Pipeline_Ball_3_Sticks_2Shells_SSFP.sh").strip()
-        self.fibre_init_method  = (self.fibre_init_method or "").strip()
-        self.fibre_queue        = (self.fibre_queue or "").strip()
-        self.fibre_njobs        = int(self.fibre_njobs or 4)
-        self.fibre_run_mcmc     = bool(self.fibre_run_mcmc)
-        self.fibre_no_levmar    = bool(self.fibre_no_levmar)
-        self.fibre_burnin       = int(self.fibre_burnin or 10000)
-        self.fibre_jumps        = int(self.fibre_jumps or 1250)
-        self.fibre_sample_every = int(self.fibre_sample_every or 25)
-        self.fibre_subject_dir  = _abs(self.fibre_subject_dir or "")
+        self.cudimot_queue: Optional[str] = y.get("cudimot_queue")
+        self.cudimot_njobs: int = int(y.get("cudimot_njobs", 4))
+        self.cudimot_run_mcmc: bool = bool(y.get("cudimot_run_mcmc", True))
+        self.cudimot_no_levmar: bool = bool(y.get("cudimot_no_levmar", True))
+        self.cudimot_burnin: int = int(y.get("cudimot_burnin", 10000))
+        self.cudimot_jumps: int = int(y.get("cudimot_jumps", 1250))
+        self.cudimot_sample_every: int = int(y.get("cudimot_sample_every", 25))
 
-        # xtract normalization
-        self.xtract_species       = (self.xtract_species or "CUSTOM").strip()
-        self.xtract_no_gpu        = bool(self.xtract_no_gpu)
-        self.xtract_ptx_steplength = float(self.xtract_ptx_steplength or 0.15)
-        self.xtract_profiles_dir  = _abs(self.xtract_profiles_dir or "")
+        self.fibre_pipeline_cmd: str = str(y.get("fibre_pipeline_cmd", "Pipeline_Ball_3_Sticks_2Shells_SSFP.sh",))
+        self.fibre_init_method: str = str(y.get("fibre_init_method", ""))
+        self.fibre_queue: str = str(y.get("fibre_queue", ""))
+        self.fibre_njobs: int = int(y.get("fibre_njobs", 4))
+        self.fibre_run_mcmc: bool = bool(y.get("fibre_run_mcmc", True))
+        self.fibre_no_levmar: bool = bool(y.get("fibre_no_levmar", True))
+        self.fibre_burnin: int = int(y.get("fibre_burnin", 10000))
+        self.fibre_jumps: int = int(y.get("fibre_jumps", 1250))
+        self.fibre_sample_every: int = int(y.get("fibre_sample_every", 25))
+        self.fibre_subject_dir: Optional[str] = _abspath(y.get("fibre_subject_dir"))
 
-        # denoising validation
-        self.run_denoise = bool(self.run_denoise)
-        self.denoise_method = (self.denoise_method or "NORDIC").strip()
-        self.denoise_name = (self.denoise_name or "data").strip()
+        # -----------------------------
+        # registration
+        # -----------------------------
+        self.reg_method: str = str(y.get("reg_method", "mmorf") or "mmorf").strip().lower()
+        if self.reg_method not in {"fnirt", "mmorf"}:
+            raise RuntimeError("reg_method must be 'fnirt' or 'mmorf'.")
+        self.REG_METHOD: str = self.reg_method.upper()  # for older checks
 
-        if self.run_denoise:
-            # locate wrapper if not explicitly set; try packaged default
-            self.denoise_sh = _abs(self.denoise_sh or pkg_file("nodes", "denoise.sh"))
-            if not (self.denoise_sh and os.path.isfile(self.denoise_sh)):
-                raise FileNotFoundError("run_denoise=True, but denoise_sh not found.")
-            # phase image is optional
-            if "data_phase" in self.data_paths:
-                self.data_paths["data_phase"] = _abs(self.data_paths.get("data_phase"))
+        self.reg2std_py: Optional[str] = _abspath(y.get("reg2std_py"))
+        self.reg2std_config: Optional[str] = _abspath(y.get("reg2std_config"))
+
+        # MMORF uses an INI template, but warp_res_init / FWHM will be set in the reg node
+        self.mmorf_config_template: Optional[str] = _abspath(
+            y.get("mmorf_config_template") or pkg_file("files", "mmorf_config_template.ini")
+        )
+
+        # -----------------------------
+        # denoising (NORDIC default)
+        # -----------------------------
+        self.run_denoise: bool = bool(y.get("run_denoise", False))
+        self.denoise_method: str = str(y.get("denoise_method", "NORDIC")).upper()
+        self.denoise_sh: Optional[str] = _abspath(y.get("denoise_sh"))
+        self.denoise_name: str = str(y.get("denoise_name", "data"))
+
+        # -----------------------------
+        # drift
+        # -----------------------------
+        self.drift_py: Optional[str] = _abspath(
+            y.get("drift_py") or pkg_file("nodes", "drift.py")
+        )
+
+        # -----------------------------
+        # FSL standard references
+        # -----------------------------
+        self.FSLDIR: str = os.environ.get("FSLDIR", "")
+        if not self.FSLDIR or not os.path.isdir(self.FSLDIR):
+            raise RuntimeError(
+                "FSLDIR environment variable not set or invalid. Please source FSL before running."
+            )
+
+        self.fsl_std_dir: str = os.path.join(self.FSLDIR, "data", "standard")
+        self.fsl_mni_t1_1mm: str = os.path.join(self.fsl_std_dir, "MNI152_T1_1mm.nii.gz")
+        self.fsl_mni_vent: str = os.path.join(self.fsl_std_dir, "MNI152_T1_2mm_VentricleMask.nii.gz")
+        self.fsl_hcp1065_fa_1mm: str = os.path.join(self.fsl_std_dir, "FSL_HCP1065_FA_1mm.nii.gz")
+        self.fsl_hcp1065_ten_1mm: str = os.path.join(self.fsl_std_dir, "FSL_HCP1065_tensor_1mm.nii.gz")
+
+        # NMT assets (shipped with package) for NHP
+        self.nmt_fa_file: Optional[str] = _abspath(y.get("nmt_fa_file") or pkg_file("files", "NMT_FA.nii.gz"))
+        self.nmt_tensor_file: Optional[str] = _abspath(y.get("nmt_tensor_file") or pkg_file("files", "NMT_tensor.nii.gz"))
+        self.nmt_ventricles_file: Optional[str] = _abspath(y.get("nmt_ventricles_file") or pkg_file("files", "NMT_v2.0_sym_05mm_ventricles.nii.gz"))
+
+        # -----------------------------
+        # mode specific: registration, drift, XTRACT
+        # -----------------------------
+        if self.MODE == "hum":
+            # Registration targets
+            self.std_fa_file: Optional[str] = _abspath(y.get("std_fa_file") or self.fsl_hcp1065_fa_1mm)
+            self.std_tensor_file: Optional[str] = _abspath(y.get("std_tensor_file") or self.fsl_hcp1065_ten_1mm)
+            # Drift masks - default ventricles is the MNI 2 mm mask that you specified
+            self.std_mask_file = _abspath(y.get("std_mask_file") or os.path.join(self.fsl_std_dir, "MNI152_T1_1mm_brain_mask.nii.gz"))
+            self.std_ventricles_file: Optional[str] = _abspath(y.get("std_ventricles_file") or self.fsl_mni_vent)
+            self.std_ref_file: Optional[str] = _abspath(y.get("std_ref_file") or self.std_fa_file)
+
+            # XTRACT defaults
+            self.xtract_species_default: str = "HUMAN"
+            self.xtract_mac_ext_default: str = ""
+            self.xtract_stdref_hum: Optional[str] = self.fsl_mni_t1_1mm
+        else:
+            # NHP: NMT references
+            self.std_fa_file = _abspath(y.get("std_fa_file") or self.nmt_fa_file)
+            self.std_tensor_file = _abspath(y.get("std_tensor_file") or self.nmt_tensor_file)
+            self.std_mask_file = _abspath(y.get("std_mask_file") or pkg_file("files", "NMT_v2.0_sym_brainmask_dil.nii.gz"))
+            self.std_ventricles_file = _abspath(y.get("std_ventricles_file") or self.nmt_ventricles_file)
+            self.std_ref_file = _abspath(y.get("std_ref_file") or self.std_fa_file)
+
+            self.xtract_species_default = "MACAQUE"
+            self.xtract_mac_ext_default = "_NMT"
+            self.xtract_stdref_hum = None
+
+        # -----------------------------
+        # XTRACT config
+        # -----------------------------
+        self.xtract_species: str = str(y.get("xtract_species", self.xtract_species_default) or self.xtract_species_default).upper()
+        self.xtract_profiles_dir: str = (_abspath(y.get("xtract_profiles_dir")) if y.get("xtract_profiles_dir") else "")
+        self.xtract_no_gpu: bool = bool(y.get("xtract_no_gpu", False))
+        self.xtract_ptx_steplength: float = float(y.get("xtract_ptx_steplength", 0.15))
+        # an optional override of the NMT mac_ext for NHP
+        self.xtract_mac_ext: str = str(y.get("xtract_mac_ext", self.xtract_mac_ext_default))
+
+        # -----------------------------
+        # streamlines / viewer (xtract QC)
+        # -----------------------------
+        self.STREAMLINES_DO: bool = bool(y.get("streamlines_do", True))
+        self.STREAMLINES_DENSITY_THRESHOLD: float = float(y.get("streamlines_density_threshold", 1e-3))
+        self.STREAMLINES_FORMAT: str = str(y.get("streamlines_format", "trk"))
+        self.STREAMLINES_PTX2_PREFIX: str = str(y.get("streamlines_ptx2_prefix", "densityNorm"))
+        self.STREAMLINES_NUM_JOBS: int = int(y.get("streamlines_num_jobs", 1))
+        self.DO_VIEWER: bool = bool(y.get("do_viewer", True))
+
+        # -----------------------------
+        # path to YAML (set in from_yaml)
+        # -----------------------------
+        self.abs_yaml_path: Optional[str] = None
+        self.source_yaml: Optional[str] = None
+
+    # -----------------------------
+    # load from YAML
+    # -----------------------------
+    @classmethod
+    def from_yaml(cls, path: str) -> "Config":
+        with open(path, "r") as f:
+            data = yaml.safe_load(f) or {}
+        cfg = cls(data)
+        cfg.abs_yaml_path = os.path.abspath(path)
+        cfg.source_yaml = cfg.abs_yaml_path
+        return cfg
+
+    # -----------------------------
+    # repr for debugging
+    # -----------------------------
+    def __repr__(self) -> str:
+        fields = {
+            "MODE": self.MODE,
+            "acqtype": self.acqtype,
+            "dmri_root": self.abs_dmri_root,
+            "run_eddy": self.run_eddy,
+            "run_spatial_drift": self.run_spatial_drift,
+            "reg_method": self.reg_method,
+            "std_fa_file": self.std_fa_file,
+        }
+        kv = ", ".join(f"{k}={v}" for k, v in fields.items())
+        return f"Config({kv})"

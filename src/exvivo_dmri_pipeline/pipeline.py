@@ -504,12 +504,21 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
     wf.connect(grads_src, "bvals_file", drift_node, "bvals")
 
     # 6) Spatial drift
-    spdrift_node = pe.Node(SpatialDrift(), name="spatial_drift")
-    spdrift_node.inputs.outdir = os.path.join(proc_dir, "data_spatial_drift")
-    spdrift_node.inputs.enable = bool(getattr(cfg, "run_spatial_drift", getattr(cfg, "RUN_SPATIAL_DRIFT", True)))
-    sel_drift_out = pe.Node(util.Select(index=0), name="select_drift_out")
-    wf.connect(drift_node, "out_files", sel_drift_out, "inlist")
-    wf.connect(sel_drift_out, "out", spdrift_node, "imain")
+    spdrift_dir = os.path.join(proc_dir, "data_spatial_drift")
+    spdrift_out = os.path.join(spdrift_dir, "data_spatial_drift.nii.gz")
+
+    if os.path.isfile(spdrift_out):
+        print("[pipeline] Detected existing spatial-drift output, reusing and skipping spatial drift.")
+        # Passthrough node so downstream nodes still see an "out_file"
+        spdrift_node = pe.Node(util.IdentityInterface(fields=["out_file"]),name="spatial_drift_passthrough")
+        spdrift_node.inputs.out_file = spdrift_out
+    else:
+        spdrift_node = pe.Node(SpatialDrift(), name="spatial_drift")
+        spdrift_node.inputs.outdir = spdrift_dir
+        spdrift_node.inputs.enable = bool(getattr(cfg, "run_spatial_drift", getattr(cfg, "RUN_SPATIAL_DRIFT", True)))
+        sel_drift_out = pe.Node(util.Select(index=0), name="select_drift_out")
+        wf.connect(drift_node, "out_files", sel_drift_out, "inlist")
+        wf.connect(sel_drift_out, "out", spdrift_node, "imain")
 
     # 6b) Link spatial-drift output into <proc>/data/data.nii.gz
     link_data = pe.Node(

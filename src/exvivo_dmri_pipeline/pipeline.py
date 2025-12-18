@@ -500,8 +500,6 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
     if std_ref and os.path.isfile(std_ref):
         drift_node.inputs.std = std_ref
 
-    drift_node.inputs.mode = mode
-
     wf.connect(gibbs_node, "out_file", drift_node, "input")
     wf.connect(grads_src, "bvals_file", drift_node, "bvals")
 

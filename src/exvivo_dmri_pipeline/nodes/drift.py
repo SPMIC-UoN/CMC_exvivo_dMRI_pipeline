@@ -43,14 +43,14 @@ def prepare_masks(indat, brainmask, ventmask, stdref, toolsdir, outdir):
     firstvol = outdir / 'firstvol.nii.gz'
 
     run([FSLBIN / 'fslroi', indat, firstvol, '0', '1'])
-    run(['fslpython', f'{toolsdir}/reg2std.py', '-fa', firstvol, '-atl', stdref, '-out', outdir / 'NMTreg'])
+    run(['fslpython', f'{toolsdir}/reg2std.py', '-fa', firstvol, '-atl', stdref, '-out', outdir / 'stdreg'])
 
     print('Warping masks to native diffusion space...')
     for img, name in zip([brainmask, ventmask], ['brainmask', 'ventmask']):
         run([FSLBIN / 'applywarp',
              '-i', img,
              '-r', firstvol,
-             '-w', outdir / 'NMTreg' / 'stdreg_std_to_anat_warp',
+             '-w', outdir / 'stdreg' / 'stdreg_std_to_anat_warp',
              '--interp=nn',
              '-o', outdir / name])
         run([FSLBIN / 'fslmaths', outdir / name, '-dilM', '-bin', outdir / name])
@@ -58,7 +58,7 @@ def prepare_masks(indat, brainmask, ventmask, stdref, toolsdir, outdir):
     run([FSLBIN / 'fslmaths', outdir / 'brainmask', '-sub', outdir / 'ventmask', '-bin', outdir / 'brainmask'])
 
     firstvol.unlink(missing_ok=True)
-    shutil.rmtree(outdir / 'NMTreg', ignore_errors=True)
+    shutil.rmtree(outdir / 'stdreg', ignore_errors=True)
 
 
 def build_input_index(images):

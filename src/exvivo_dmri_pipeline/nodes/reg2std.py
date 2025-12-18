@@ -39,13 +39,6 @@ required.add_argument("-out", metavar='<path>', required=True, help="Output dire
 optional.add_argument("-config", metavar='<path>', required=False, help="Config file (default is $FSLDIR/data/xtract_data/standard/F99/config)")
 argsa = parser.parse_args()
 
-# test paths
-# argsa = lambda:0
-# argsa.fa = '/data/CMC_fromAxon/20240509-ST001-Moe_exvivo_050924/NIFTI/dtifit/dti_FA.nii.gz'
-# argsa.atl = '/home/mszsaw2/xtract_standards/macaque_multitemplate/MACAQUE_NMT.nii.gz'
-# argsa.out = '/data/CMC_fromAxon/20240509-ST001-Moe_exvivo_050924/NIFTI/NMTreg'
-# argsa.config = None
-
 # start
 fa = argsa.fa
 atl = argsa.atl

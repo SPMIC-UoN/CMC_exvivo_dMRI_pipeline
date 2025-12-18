@@ -488,10 +488,20 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
     drift_node.inputs.model = "single"
     drift_node.inputs.outdir = os.path.join(proc_dir, "drift_correction")
     drift_node.inputs.output = ["data_corrected.nii.gz"]
-    drift_node.inputs.mask = getattr(cfg, "std_mask_file", None)
-    drift_node.inputs.vent = getattr(cfg, "std_ventricles_file", None)
-    drift_node.inputs.std = getattr(cfg, "std_ref_file", None)
+    std_mask = getattr(cfg, "std_mask_file", None)
+    if std_mask and os.path.isfile(std_mask):
+        drift_node.inputs.mask = std_mask
+
+    std_vent = getattr(cfg, "std_ventricles_file", None)
+    if std_vent and os.path.isfile(std_vent):
+        drift_node.inputs.vent = std_vent
+
+    std_ref = getattr(cfg, "std_ref_file", None)
+    if std_ref and os.path.isfile(std_ref):
+        drift_node.inputs.std = std_ref
+
     drift_node.inputs.mode = mode
+
     wf.connect(gibbs_node, "out_file", drift_node, "input")
     wf.connect(grads_src, "bvals_file", drift_node, "bvals")
 

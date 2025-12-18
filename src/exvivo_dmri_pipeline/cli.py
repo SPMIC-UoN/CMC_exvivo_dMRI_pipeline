@@ -23,8 +23,8 @@ def _read_nonempty_lines(path: str) -> List[str]:
         return []
     return out
 
+
 def _require_files(paths: List[str], what: str) -> None:
-    import os
     missing: List[str] = []
     broken: List[str] = []
 
@@ -54,36 +54,66 @@ def _require_files(paths: List[str], what: str) -> None:
 # (expects preproc outputs on disk)
 # -------------------------------
 def _check_tractonly_outputs(cfg: Config) -> None:
+    """
+    Tract-only mode expects that the main preprocessing has already been run
+    with the current pipeline layout:
+
+      <dmri_root>/
+        data/
+          data.nii.gz
+          nodif_brain_mask.nii.gz
+          bvals, bvecs        (for SE)
+          CFP, FixP           (for SSFP)
+        stdreg/
+          stdreg_anat_to_std_warp.nii.gz
+          stdreg_std_to_anat_warp.nii.gz
+          or combined_warp.nii.gz, combined_warp_inv.nii.gz (MMORF)
+    """
     dmri_root = cfg.abs_dmri_root
-    proc_dir = os.path.join(dmri_root, "proc")
+    proc_dir = dmri_root
     data_dir = os.path.join(proc_dir, "data")
-    reg_dir = os.path.join(proc_dir, "NMTreg")
+    stdreg_dir = os.path.join(proc_dir, "stdreg")
 
     data_4d = os.path.join(data_dir, "data.nii.gz")
     mask = os.path.join(data_dir, "nodif_brain_mask.nii.gz")
-    _require_files([data_4d, mask], "preprocessed diffusion outputs in <dmri_root>/proc/data")
+    _require_files(
+        [data_4d, mask],
+        "preprocessed diffusion outputs in <dmri_root>/data",
+    )
 
-    # SE tract-only additionally needs bvals/bvecs present in <proc>/data
+    # SE tract-only additionally needs bvals/bvecs present in <dmri_root>/data
     if cfg.acqtype.lower().strip() == "se":
         bvals = os.path.join(data_dir, "bvals")
         bvecs = os.path.join(data_dir, "bvecs")
-        _require_files([bvals, bvecs], "preprocessed diffusion gradients in <dmri_root>/proc/data")
+        _require_files(
+            [bvals, bvecs],
+            "preprocessed diffusion gradients in <dmri_root>/data",
+        )
 
     # Warps required for XTRACT
-    if cfg.REG_METHOD.upper().strip() == "FNIRT":
-        warp_s2a = os.path.join(reg_dir, "warp_std2anat.nii.gz")
-        warp_a2s = os.path.join(reg_dir, "warp_anat2std.nii.gz")
-        _require_files([warp_s2a, warp_a2s], "FNIRT warps in <dmri_root>/proc/NMTreg")
+    if cfg.reg_method.lower().strip() == "fnirt":
+        warp_a2s = os.path.join(stdreg_dir, "stdreg_anat_to_std_warp.nii.gz")
+        warp_s2a = os.path.join(stdreg_dir, "stdreg_std_to_anat_warp.nii.gz")
+        _require_files(
+            [warp_s2a, warp_a2s],
+            "FNIRT warps in <dmri_root>/stdreg",
+        )
     else:
-        warp = os.path.join(reg_dir, "combined_warp.nii.gz")
-        warp_inv = os.path.join(reg_dir, "combined_warp_inv.nii.gz")
-        _require_files([warp, warp_inv], "MMORF warps in <dmri_root>/proc/NMTreg")
+        warp = os.path.join(stdreg_dir, "combined_warp.nii.gz")
+        warp_inv = os.path.join(stdreg_dir, "combined_warp_inv.nii.gz")
+        _require_files(
+            [warp, warp_inv],
+            "MMORF warps in <dmri_root>/stdreg",
+        )
 
-    # SSFP needs CFP/FixP already present (they’re created during preproc)
+    # SSFP needs CFP/FixP already present (they are created during preproc)
     if cfg.acqtype.lower().strip() == "ssfp":
         cfp = os.path.join(data_dir, "CFP")
         fixp = os.path.join(data_dir, "FixP")
-        _require_files([cfp, fixp], "SSFP manifests (CFP/FixP) in <dmri_root>/proc/data")
+        _require_files(
+            [cfp, fixp],
+            "SSFP manifests (CFP/FixP) in <dmri_root>/data",
+        )
 
         bad_refs = []
         for manifest in (cfp, fixp):
@@ -96,14 +126,19 @@ def _check_tractonly_outputs(cfg: Config) -> None:
                     bad_refs.append(f"{manifest} -> missing: {r}")
         if bad_refs:
             raise SystemExit(
-                "[cmc_exvivo_pipeline] Invalid paths in CFP/FixP manifests:\n  - " +
-                "\n  - ".join(bad_refs)
+                "[cmc_exvivo_pipeline] Invalid paths in CFP/FixP manifests:\n  - "
+                + "\n  - ".join(bad_refs)
             )
+
 
 # -------------------------------
 # Checks for FULL mode
 # -------------------------------
 def _check_full_inputs(cfg: Config) -> None:
+    """
+    Sanity checks for running the full pipeline from raw inputs,
+    aligned with the new Config (lowercased keys and layout).
+    """
     acq = cfg.acqtype.lower().strip()
 
     # Core diffusion inputs
@@ -115,18 +150,35 @@ def _check_full_inputs(cfg: Config) -> None:
         ]
         _require_files(need, "raw diffusion inputs (SE) from YAML")
     else:
-        # SSFP: gradients are not mandatory here (they may be unused);
-        # we still require the main data and SSFP resources below.
+        # SSFP: gradients are not mandatory here, but main data must exist.
         need = [cfg.data_paths.get("data_nii")]
         _require_files(need, "raw diffusion input (SSFP) from YAML")
 
-    # SSFP: sidecars + maps are required up front
+    # SSFP: sidecars + maps required up front
     if acq == "ssfp":
-        sidecars = [cfg.sidecars.get(k, "") for k in
-                    ("TRs", "diffGradAmps", "diffGradDurs", "flipAngles", "flipMask", "noisefloor")]
-        maps = [cfg.maps.get(k, "") for k in ("T1map", "T2map", "B1map")]
-        _require_files(sidecars, "SSFP sidecar files (TRs/diffGradAmps/diffGradDurs/flipAngles/flipMask/noisefloor)")
-        _require_files(maps, "SSFP quantitative maps (T1map/T2map/B1map)")
+        # Config lowercases keys, so use trs, diffgradamps, etc.
+        sidecars = [
+            cfg.sidecars.get("trs", ""),
+            cfg.sidecars.get("diffgradamps", ""),
+            cfg.sidecars.get("diffgraddurs", ""),
+            cfg.sidecars.get("flipangles", ""),
+            cfg.sidecars.get("flipmask", ""),
+            cfg.sidecars.get("noisefloor", ""),
+        ]
+        maps = [
+            cfg.maps.get("t1map", ""),
+            cfg.maps.get("t2map", ""),
+            cfg.maps.get("b1map", ""),
+        ]
+        _require_files(
+            sidecars,
+            "SSFP sidecar files (TRs/diffGradAmps/diffGradDurs/flipAngles/flipMask/noisefloor)",
+        )
+        _require_files(
+            maps,
+            "SSFP quantitative maps (T1map/T2map/B1map)",
+        )
+
 
 # -------------------------------
 # CLI entry
@@ -146,16 +198,30 @@ def _compute_run_mode(args) -> str:
 def main(argv=None):
     p = argparse.ArgumentParser(
         prog="cmc_exvivo_pipeline",
-        description="CMC ex-vivo dMRI pipeline"
+        description="CMC ex vivo dMRI pipeline",
     )
     p.add_argument("config", help="Path to YAML config file")
-    p.add_argument("-v", "--verbose", action="store_true", help="Enable verbose / debug logs")
-    p.add_argument("--preproc", action="store_true",
-                   help="Build/run preprocessing only")
-    p.add_argument("--tractography", action="store_true",
-                   help="Build/run tractography stage (assumes preproc outputs unless combined with --preproc)")
-    p.add_argument("--full", action="store_true",
-                   help="Build/run full pipeline (equivalent to --preproc --tractography)")
+    p.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable verbose / debug logs",
+    )
+    p.add_argument(
+        "--preproc",
+        action="store_true",
+        help="Build/run preprocessing only",
+    )
+    p.add_argument(
+        "--tractography",
+        action="store_true",
+        help="Build/run tractography stage (assumes preproc outputs unless combined with --preproc)",
+    )
+    p.add_argument(
+        "--full",
+        action="store_true",
+        help="Build/run full pipeline (equivalent to --preproc --tractography)",
+    )
 
     args = p.parse_args(argv)
     cfg = Config.from_yaml(args.config)

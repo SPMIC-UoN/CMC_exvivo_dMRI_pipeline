@@ -505,7 +505,7 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
 
     # 6) Spatial drift
     spdrift_dir = os.path.join(proc_dir, "data_spatial_drift")
-    spdrift_out = os.path.join(spdrift_dir, "data_spatial_drift.nii.gz")
+    spdrift_out = os.path.join(spdrift_dir, "data_reg.nii.gz")
 
     if os.path.isfile(spdrift_out):
         print("[pipeline] Detected existing spatial-drift output, reusing and skipping spatial drift.")

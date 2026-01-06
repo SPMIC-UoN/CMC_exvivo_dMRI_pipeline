@@ -191,6 +191,8 @@ class MMORFReg(BaseInterface):
             "subject_fa_file",
             "subject_tensor_file",
             "subject_aff_mat",
+            "warp_res_init_arg",
+            "fwhm_set",
         ]
         leftovers = [p for p in placeholders if p in text]
         if leftovers:
@@ -205,10 +207,6 @@ class MMORFReg(BaseInterface):
     def _mode_params(self, mode: str):
         """
         Return warp_res_init and FWHM list according to mode.
-
-        This mirrors the in vivo settings:
-          - NHP: finer, smaller kernels
-          - HUM: coarser, larger kernels
         """
         mode = (mode or "nhp").lower()
 
@@ -223,35 +221,42 @@ class MMORFReg(BaseInterface):
 
     def _inject_multiscale(self, txt: str, mode: str) -> str:
         """
-        Inject warp_res_init and replace all fwhm_set placeholders in the
-        scalar and tensor sections, as in the in vivo implementation.
+        Inject warp_res_init and FWHM schedule.
+
+        This relies on the exact placeholder forms in the template:
+          warp_res_init           = warp_res_init_arg
+          fwhm_ref_scalar     = fwhm_set
+          fwhm_mov_scalar     = fwhm_set
+          fwhm_ref_tensor     = fwhm_set
+          fwhm_mov_tensor     = fwhm_set
         """
         warp_res_init, fset = self._mode_params(mode)
         fset_str = " ".join(f"{v:g}" for v in fset)
 
-        # 1) warp_res_init: override any existing value
-        txt = re.sub(
-            r"^warp_res_init\s*=.*$",
-            f"warp_res_init = {warp_res_init}",
-            txt,
-            flags=re.MULTILINE,
+        # Match the exact strings from the template
+        txt = txt.replace(
+            "warp_res_init           = warp_res_init_arg",
+            f"warp_res_init           = {warp_res_init}"
+        )
+        txt = txt.replace(
+            "fwhm_ref_scalar     = fwhm_set",
+            f"fwhm_ref_scalar     = {fset_str}"
+        )
+        txt = txt.replace(
+            "fwhm_mov_scalar     = fwhm_set",
+            f"fwhm_mov_scalar     = {fset_str}"
+        )
+        txt = txt.replace(
+            "fwhm_ref_tensor     = fwhm_set",
+            f"fwhm_ref_tensor     = {fset_str}"
+        )
+        txt = txt.replace(
+            "fwhm_mov_tensor     = fwhm_set",
+            f"fwhm_mov_tensor     = {fset_str}"
         )
 
-        # 2) Replace the four explicit fwhm_* lines that use 'fwhm_set'
-        patterns = [
-            "fwhm_ref_scalar",
-            "fwhm_mov_scalar",
-            "fwhm_ref_tensor",
-            "fwhm_mov_tensor",
-        ]
-        for key in patterns:
-            # handle any spacing but require fwhm_set on the right hand side
-            pattern = rf"^{key}\s*=\s*fwhm_set\s*$"
-            replacement = f"{key}     = {fset_str}"
-            txt = re.sub(pattern, replacement, txt, flags=re.MULTILINE)
-
         return txt
-
+    
     def _run_interface(self, runtime):
         out = os.path.abspath(self.inputs.outdir)
         os.makedirs(out, exist_ok=True)

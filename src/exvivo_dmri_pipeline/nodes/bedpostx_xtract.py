@@ -241,12 +241,6 @@ class Xtract(CommandLine):
         return os.path.abspath(val)
 
     def _resolve_source(self) -> str:
-        """
-        Decide which directory to feed to `xtract -bpx`:
-          - If bpx_dir is set and looks like a bedpostX dir, use it.
-          - Else if cudimot_dir is set, use it.
-          - Else error.
-        """
         bpx = getattr(self.inputs, "bpx_dir", "") or ""
         cud = getattr(self.inputs, "cudimot_dir", "") or ""
 
@@ -259,9 +253,7 @@ class Xtract(CommandLine):
 
         def _looks_cudimot(p: str) -> bool:
             return os.path.isdir(p) and (
-                glob.glob(os.path.join(p, "Param_*"))
-                or os.path.isfile(os.path.join(p, "dti_FA.nii.gz"))
-            )
+                glob.glob(os.path.join(p, "Param_*")))
 
         if bpx and os.path.isdir(bpx):
             if _looks_bedpostx(bpx) or _looks_cudimot(bpx):

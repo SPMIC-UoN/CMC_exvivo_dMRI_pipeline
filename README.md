@@ -60,6 +60,9 @@ Acquisition mode:
 
 ## 4) Installation
 
+### Docker version: https://hub.docker.com/repository/docker/swarrington1/cmc-exvivo
+- docker pull swarrington1/cmc-exvivo:v0.1.0
+
 Below is a minimal, reproducible setup using Conda.
 
 1. **Install core software**

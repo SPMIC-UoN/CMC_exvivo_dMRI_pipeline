@@ -204,7 +204,7 @@ class Config:
         self.cudimot_jumps: int = int(y.get("cudimot_jumps", 1250))
         self.cudimot_sample_every: int = int(y.get("cudimot_sample_every", 25))
 
-        self.fibre_pipeline_cmd: str = str(y.get("fibre_pipeline_cmd", "Pipeline_Ball_3_Sticks_2Shells_SSFP.sh",))
+        self.fibre_pipeline_cmd: str = str(y.get("fibre_pipeline_cmd", "Pipeline_Ball_3_Sticks_1Shell_SSFP.sh",))
         self.fibre_init_method: str = str(y.get("fibre_init_method", ""))
         self.fibre_queue: str = str(y.get("fibre_queue", ""))
         self.fibre_njobs: int = int(y.get("fibre_njobs", 4))

@@ -195,7 +195,7 @@ class WritePathsFileOutputSpec(TraitedSpec):
     FixP = File(desc="FixP file (written in both lowershell_dir and data_dir; SSFP only)")
     lowershell_fixp = File()
     data_fixp       = File()
-    data_cfp        = File(desc="CFP for Ball_3_Sticks_2Shells_SSFP written in data_dir")
+    data_cfp        = File(desc="CFP for Ball_3_Sticks_1Shell_SSFP written in data_dir")
     lowershell_cfp  = File()
 
 
@@ -208,8 +208,8 @@ class WritePathsFile(BaseInterface):
 
     def _compose_cfp_full_for_ball(self, base_dir: str) -> List[str]:
         """
-        Ball_3_Sticks_2Shells_SSFP expects:
-          bvecs, bvals, TRs, diffGradAmps, diffGradDurs, flipAngles, whichshell, noisefloor
+        Ball_3_Sticks_1Shell_SSFP expects:
+          bvecs, bvals, TRs, diffGradAmps, diffGradDurs, flipAngles, noisefloor
         """
         bvecs = os.path.join(base_dir, "bvecs")
         return [
@@ -219,7 +219,7 @@ class WritePathsFile(BaseInterface):
             os.path.join(base_dir, "diffGradAmps"),
             os.path.join(base_dir, "diffGradDurs"),
             os.path.join(base_dir, "flipAngles"),
-            os.path.join(base_dir, "whichshell"),
+            # os.path.join(base_dir, "whichshell"),
             os.path.join(base_dir, "noisefloor"),
         ]
 
@@ -274,7 +274,7 @@ class WritePathsFile(BaseInterface):
         lowershell_fixp = _write_lines(os.path.join(ls_dir,  "FixP"), self._compose_fixp(t1, t2, b1))
         data_fixp       = _write_lines(os.path.join(data_dir, "FixP"), self._compose_fixp(t1, t2, b1))
 
-        # Full-data CFP for Ball_3_Sticks_2Shells_SSFP
+        # Full-data CFP for Ball_3_Sticks_1Shell_SSFP
         data_cfp = _write_lines(os.path.join(data_dir, "CFP"),
                                 self._compose_cfp_full_for_ball(sidecars_dir))
 

@@ -22,7 +22,7 @@ class FibreCudimotInputSpec(CommandLineInputSpec):
     subject_dir = Directory(position=0, argstr="%s", mandatory=True,
                             desc="Subject directory <proc>/data containing data.nii(.gz), mask, CFP, FixP")
     pipeline_cmd = traits.Str(
-        "Pipeline_Ball_3_Sticks_1Shell_SSFP.sh",
+        "Pipeline_Ball_3_Sticks_2Shells_SSFP.sh",
         usedefault=True,
         desc="CUDIMOT pipeline script (on PATH or absolute)"
     )
@@ -96,7 +96,7 @@ class FibreCudimot(CommandLine):
         os.makedirs(subj, exist_ok=True)
         self._preflight(subj)
 
-        pipe   = (self.inputs.pipeline_cmd or "").strip() or "Pipeline_Ball_3_Sticks_1Shell_SSFP.sh"
+        pipe   = (self.inputs.pipeline_cmd or "").strip() or "Pipeline_Ball_3_Sticks_2Shells_SSFP.sh"
         finish = self._finish_script(pipe)
         model  = self._model_name(pipe)
         model_dir = os.path.join(proc, f"data.{model}")        # <proc>/data.<ModelName>
@@ -127,7 +127,7 @@ class FibreCudimot(CommandLine):
         o = self._outputs().get()
         subj = os.path.abspath(self.inputs.subject_dir)
         proc = os.path.dirname(subj)
-        model = self._model_name((self.inputs.pipeline_cmd or "").strip() or "Pipeline_Ball_3_Sticks_1Shell_SSFP.sh")
+        model = self._model_name((self.inputs.pipeline_cmd or "").strip() or "Pipeline_Ball_3_Sticks_2Shells_SSFP.sh")
         o["subject_dir"] = subj
         o["cudimot_dir"] = os.path.join(proc, f"data.{model}")
         return o

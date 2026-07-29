@@ -227,7 +227,7 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
 
             fibre_node = pe.Node(FibreCudimot(), name="fibre_cudimot")
             fibre_node.inputs.subject_dir = datadir
-            fibre_node.inputs.pipeline_cmd = getattr(cfg, "fibre_pipeline_cmd", getattr(cfg, "FIBRE_PIPELINE_CMD", "Pipeline_Ball_3_Sticks_1Shell_SSFP.sh"))
+            fibre_node.inputs.pipeline_cmd = getattr(cfg, "fibre_pipeline_cmd", getattr(cfg, "FIBRE_PIPELINE_CMD", "Pipeline_Ball_3_Sticks_2Shells_SSFP.sh"))
             fibre_node.inputs.init_method = getattr(cfg, "fibre_init_method", getattr(cfg, "FIBRE_INIT_METHOD", ""))
             fibre_node.inputs.queue = getattr(cfg, "fibre_queue", getattr(cfg, "FIBRE_QUEUE", ""))
             fibre_node.inputs.njobs = int(getattr(cfg, "fibre_njobs", getattr(cfg, "FIBRE_NJOBS", 4)))
@@ -684,7 +684,7 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
 
             fibre_node = pe.Node(FibreCudimot(), name="fibre_cudimot")
             fibre_node.inputs.subject_dir = datadir
-            fibre_node.inputs.pipeline_cmd = getattr(cfg, "fibre_pipeline_cmd", getattr(cfg, "FIBRE_PIPELINE_CMD", "Pipeline_Ball_3_Sticks_1Shell_SSFP.sh"))
+            fibre_node.inputs.pipeline_cmd = getattr(cfg, "fibre_pipeline_cmd", getattr(cfg, "FIBRE_PIPELINE_CMD", "Pipeline_Ball_3_Sticks_2Shells_SSFP.sh"))
             fibre_node.inputs.init_method = getattr(cfg, "fibre_init_method", getattr(cfg, "FIBRE_INIT_METHOD", ""))
             fibre_node.inputs.queue = getattr(cfg, "fibre_queue", getattr(cfg, "FIBRE_QUEUE", ""))
             fibre_node.inputs.njobs = int(getattr(cfg, "fibre_njobs", getattr(cfg, "FIBRE_NJOBS", 4)))

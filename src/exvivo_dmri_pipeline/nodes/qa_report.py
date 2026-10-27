@@ -3,6 +3,10 @@ import os
 import json
 import datetime
 import subprocess
+import html
+import shutil
+import textwrap
+from pathlib import Path
 
 import numpy as np
 import nibabel as nib
@@ -15,6 +19,7 @@ from nipype.interfaces.base import (
     BaseInterfaceInputSpec,
     TraitedSpec,
     File,
+    Directory,
     traits,
     SimpleInterface,
     isdefined,
@@ -58,6 +63,7 @@ class QAReportInputSpec(BaseInterfaceInputSpec):
         exists=False,
         desc="Standard-space brain mask or template image for outlining (e.g., FA template or brain mask)",
     )
+    std_fa_img = File(exists=False, desc="Standard-space FA template")
 
     # Native diffusion-space inputs
     data_4d = File(exists=False, desc="4D diffusion data (post-EDDY if applicable)")
@@ -76,6 +82,10 @@ class QAReportInputSpec(BaseInterfaceInputSpec):
 
 class QAReportOutputSpec(TraitedSpec):
     report_pdf = File(desc="Path to the generated PDF QA report")
+    report_pdf_dark = File(desc="Dark PDF export")
+    report_html = File(desc="Theme-switchable HTML report")
+    manifest_json = File(desc="QA sources and issues")
+    figures_dir = Directory(desc="Individual QA panels")
 
 
 class QAReport(SimpleInterface):
@@ -197,6 +207,14 @@ class QAReport(SimpleInterface):
     # -------- main interface --------
 
     def _run_interface(self, runtime):
+        # The modern report is self-contained and deliberately follows only
+        # pipeline-owned paths. Keep the legacy implementation below temporarily
+        # for source compatibility, but do not execute it.
+        modern = _ModernReport(self.inputs)
+        self._results.update({key: str(value) for key, value in modern.build().items()})
+        return runtime
+
+        # Legacy report implementation (unreachable; retained for now).
         # --------------------------------
         # Setup paths
         # --------------------------------
@@ -553,5 +571,229 @@ class QAReport(SimpleInterface):
 
     def _list_outputs(self):
         outputs = self._outputs().get()
-        outputs["report_pdf"] = getattr(self, "_report_pdf", None)
+        outputs.update(getattr(self, "_results", {}))
         return outputs
+
+
+class _ModernReport:
+    """HTML/dual-PDF report for pipeline-owned ex-vivo outputs."""
+
+    THEMES = {
+        "light": ("#ffffff", "#172033", "#3274a1"),
+        "dark": ("#111827", "#f3f4f6", "#60a5fa"),
+    }
+
+    def __init__(self, inputs):
+        self.inputs = inputs
+        self.root = Path(str(inputs.dmri_root or ".")).expanduser().resolve()
+        self.out = Path(str(inputs.outdir or self.root / "QA")).expanduser().resolve()
+        self.figdir = self.out / "figures"
+        self.sections, self.issues, self.sources = [], [], {}
+        self.config = {}
+        self.acqtype, self.mode = "ssfp", "unknown"  # SSFP is the pipeline default.
+
+    def value(self, name):
+        value = getattr(self.inputs, name)
+        return str(value) if isdefined(value) and value else ""
+
+    def source(self, key, *paths):
+        for item in paths:
+            path = Path(item).expanduser() if item else None
+            if path and path.is_file():
+                self.sources[key] = str(path.resolve())
+                return path
+        return None
+
+    def issue(self, level, title, detail):
+        self.issues.append({"severity": level, "title": title, "detail": str(detail)})
+
+    def section(self, title, intro):
+        result = {"title": title, "intro": intro, "figures": [], "notes": []}
+        self.sections.append(result)
+        return result
+
+    @staticmethod
+    def volume(path, index=0):
+        image = nib.load(str(path))
+        data = np.asarray(image.dataobj[..., index] if len(image.shape) == 4 else image.dataobj,
+                          dtype=np.float32)
+        return np.asarray(nib.as_closest_canonical(nib.Nifti1Image(data, image.affine)).dataobj)
+
+    @staticmethod
+    def views(data):
+        xyz = tuple(size // 2 for size in data.shape[:3])
+        return (np.rot90(data[xyz[0]]), np.rot90(data[:, xyz[1]]), np.rot90(data[:, :, xyz[2]]))
+
+    def add_panel(self, section, stem, title, caption, rows, masks=None):
+        names = {}
+        for theme, (bg, fg, _) in self.THEMES.items():
+            output = self.figdir / f"{stem}_{theme}.png"
+            try:
+                arrays = [(label, self.volume(path, index)) for label, path, index in rows]
+                samples = np.concatenate([a[::5, ::5, ::5].ravel() for _, a in arrays])
+                samples = samples[np.isfinite(samples) & (samples > 0)]
+                vmax = float(np.percentile(samples, 99.5)) if samples.size else 1
+                with plt.rc_context({"figure.facecolor": bg, "axes.facecolor": bg,
+                                     "text.color": fg, "axes.labelcolor": fg}):
+                    fig, axes = plt.subplots(len(arrays), 3, figsize=(15, 3.4 * len(arrays)),
+                                             squeeze=False, layout="constrained")
+                    fig.suptitle(title, fontsize=18, weight="semibold")
+                    for i, (label, data) in enumerate(arrays):
+                        overlay = self.volume(masks[i][0], masks[i][1]) if masks and masks[i] else None
+                        for j, view in enumerate(self.views(data)):
+                            axes[i, j].imshow(view, cmap="gray", vmin=0, vmax=vmax)
+                            if overlay is not None:
+                                axes[i, j].contour(self.views(overlay)[j] > .5, levels=[.5],
+                                                   colors="#fb7185", linewidths=1)
+                            axes[i, j].set_title(("Sagittal", "Coronal", "Axial")[j] if i == 0 else "")
+                            axes[i, j].set_ylabel(label, color=fg, weight="semibold")
+                            axes[i, j].axis("off")
+                    fig.savefig(output, dpi=165, facecolor=bg); plt.close(fig)
+                names[theme] = output.name
+            except Exception as exc:
+                self.issue("warning", f"Could not render {title} ({theme})", exc)
+        if names:
+            section["figures"].append({"title": title, "caption": caption,
+                "light": names.get("light") or names.get("dark"),
+                "dark": names.get("dark") or names.get("light")})
+
+    def _read_config(self):
+        config = self.source("config", self.value("pipeline_yaml"), self.root / "config_used.yaml")
+        if not config:
+            self.issue("warning", "Saved configuration unavailable", "SSFP defaults were assumed.")
+            return
+        try:
+            self.config = {str(k).lower(): v for k, v in (yaml.safe_load(config.read_text()) or {}).items()}
+            self.acqtype = str(self.config.get("acqtype", "ssfp")).lower()
+            self.mode = str(self.config.get("mode", "unknown")).lower()
+        except Exception as exc:
+            self.issue("error", "Cannot read saved configuration", exc)
+
+    def _config_data(self):
+        value = (self.config.get("data_paths") or {}).get("data_nii")
+        if not value: return None
+        path = Path(value).expanduser()
+        base = Path(self.sources["config"]).parent if "config" in self.sources else Path.cwd()
+        return path if path.is_absolute() else base / path
+
+    def _stages(self):
+        raw = self.source("raw_data", self._config_data())
+        current = raw
+        pairs = []
+        if bool(self.config.get("run_denoise", False)):
+            den = self.source("denoised_data", self.root / "denoise" /
+                              (str(self.config.get("denoise_name", "data")) + ".nii.gz"))
+            pairs.append(("Denoising", current, den, "Raw and denoised data with shared scaling.")); current = den or current
+        if current:
+            stem = current.name[:-7] if current.name.endswith(".nii.gz") else current.stem
+            gibbs = self.source("gibbs_data", self.root / "gibbs" / f"{stem}_gibbs3d.nii.gz",
+                                self.root / "gibbs" / f"{stem}_gibbs2d.nii.gz")
+        else: gibbs = None
+        pairs.append(("Gibbs unringing", current, gibbs, "Check high-contrast boundaries for reduced ringing without blurring."))
+        drift = self.source("temporal_drift_data", self.root / "drift_correction" / "data_corrected.nii.gz")
+        pairs.append(("Temporal drift correction", gibbs, drift, "Representative matched volume before and after temporal correction."))
+        spatial = self.source("spatial_drift_data", self.root / "data_spatial_drift" / "data_reg.nii.gz")
+        if bool(self.config.get("run_spatial_drift", True)):
+            pairs.append(("Spatial drift correction", drift, spatial, "Representative matched volume before and after within-series alignment."))
+        for number, (title, before, after, caption) in enumerate(pairs):
+            section = self.section(title, caption)
+            if before and after:
+                self.add_panel(section, f"stage_{number}", title, caption,
+                               [("Before", before, 0), ("After", after, 0)])
+            else: section["notes"].append("Required pipeline-owned before/after files were unavailable.")
+            if title == "Temporal drift correction":
+                plot = self.source("temporal_drift_plot", self.root / "drift_correction" / "drift_plot.png")
+                if plot:
+                    dst = self.figdir / "temporal_drift_metrics.png"; shutil.copy2(plot, dst)
+                    section["figures"].append({"title": "Temporal drift model", "caption": "Pipeline-generated drift fit and assessment.", "light": dst.name, "dark": dst.name})
+
+    def _eddy(self):
+        section = self.section("EDDY signal quality", "QUAD signal/CNR metrics only. Motion and EDDY-corrected images are intentionally excluded for fixed tissue.")
+        qcpath = self.source("eddy_qc", self.value("eddy_qc_json"), self.root / "eddy" / "eddy.qc" / "qc.json")
+        if not qcpath: section["notes"].append("EDDY QUAD output was unavailable."); return
+        try: qc = json.loads(qcpath.read_text())
+        except Exception as exc: self.issue("error", "Cannot parse EDDY QC", exc); return
+        values = qc.get("qc_cnr_avg") or []; shells = qc.get("data_unique_bvals") or qc.get("b_shells") or []
+        if not values: section["notes"].append("No QUAD SNR/CNR values were present."); return
+        for theme, (bg, fg, _) in self.THEMES.items():
+            out = self.figdir / f"eddy_signal_{theme}.png"
+            with plt.rc_context({"figure.facecolor": bg, "axes.facecolor": bg, "text.color": fg}):
+                fig, axes = plt.subplots((len(values)+1)//2, 2, figsize=(14, max(5, 3.5*((len(values)+1)//2))), squeeze=False, layout="constrained")
+                for i, ax in enumerate(axes.flat):
+                    ax.axis("off")
+                    if i >= len(values): continue
+                    shell = shells[i] if i < len(shells) else None
+                    label = "b0 SNR" if i == 0 or shell == 0 else f"b={shell} CNR"
+                    ax.set_title(f"{label}: {values[i]:.2f}", color=fg)
+                    png = qcpath.parent / f"cnr{i:04d}.nii.gz.png"
+                    if png.is_file(): ax.imshow(plt.imread(png))
+                fig.savefig(out, dpi=165, facecolor=bg); plt.close(fig)
+        section["figures"].append({"title": "b0 SNR and shell CNR", "caption": "EDDY is diagnostic-only in this pipeline.", "light": "eddy_signal_light.png", "dark": "eddy_signal_dark.png"})
+
+    def _final_maps(self):
+        data = self.source("final_data", self.value("data_4d"), self.root / "data" / "data.nii.gz")
+        mask = self.source("native_mask", self.value("mask_file"), self.root / "data" / "nodif_brain_mask.nii.gz")
+        section = self.section("Final data and brain mask", "The actual downstream data, not EDDY's diagnostic output.")
+        if data and mask: self.add_panel(section, "mask", "Final data with mask", "Red outline is the modelling mask.", [("Final data", data, 0)], [(mask, 0)])
+        else: section["notes"].append("Final data or mask was unavailable.")
+
+        fa = self.source("fa_native", self.value("fa_img"))
+        tensor = self.section("Diffusion tensor model", f"{self.acqtype.upper()} tensor outputs; SSFP CUDIMOT is the default branch.")
+        if fa:
+            md = self.source("md_native", fa.with_name(fa.name.replace("_FA", "_MD")))
+            v1 = self.source("v1_native", fa.with_name(fa.name.replace("_FA", "_V1")))
+            rows = [("FA", fa, 0)] + ([("MD", md, 0)] if md else [])
+            self.add_panel(tensor, "tensor", "FA and MD", "Pipeline-selected lower-shell tensor maps.", rows)
+            if not v1: tensor["notes"].append("V1 was not found beside the pipeline FA output.")
+        else: tensor["notes"].append("Pipeline FA output was unavailable.")
+
+        reg = self.section("Standard-space registration", "Subject FA compared with the configured standard-space FA template.")
+        subject = self.source("fa_standard", self.root / "stdreg" / "FA_in_STD.nii.gz")
+        reference = self.source("fa_template", self.value("std_fa_img"))
+        if subject and reference: self.add_panel(reg, "registration", "Subject and template FA", "Inspect cortical, callosal, brainstem and cerebellar agreement.", [("Subject FA", subject, 0), ("Template FA", reference, 0)])
+        else: reg["notes"].append("Subject or template standard-space FA was unavailable.")
+
+    def _xtract(self):
+        section = self.section("XTRACT overview", "Only the pipeline xtract directory is included; xtract.*, TDI and comparison directories are ignored.")
+        xdir = Path(self.value("xtract_dir") or self.root / "xtract")
+        for name in ("xtract_sagittal.png", "xtract_coronal.png", "xtract_axial.png"):
+            src = xdir / name
+            if src.is_file():
+                dst = self.figdir / name; shutil.copy2(src, dst)
+                section["figures"].append({"title": src.stem.replace("xtract_", "").title(), "caption": "Pipeline viewer export.", "light": dst.name, "dark": dst.name})
+        if not section["figures"]: section["notes"].append("XTRACT was not requested or viewer outputs were unavailable.")
+
+    def build(self):
+        self.figdir.mkdir(parents=True, exist_ok=True); self._read_config(); self._stages(); self._eddy(); self._final_maps(); self._xtract()
+        return self._write()
+
+    def _write(self):
+        stamp = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+        html_path, light, dark = self.out / "CMC_exvivo_QA.html", self.out / "CMC_exvivo_QA.pdf", self.out / "CMC_exvivo_QA_dark.pdf"
+        manifest = self.out / "QA_manifest.json"
+        meta = {"generated": stamp, "root": str(self.root), "acqtype": self.acqtype, "mode": self.mode, "run_mode": self.inputs.run_mode}
+        manifest.write_text(json.dumps({"metadata": meta, "issues": self.issues, "sources": self.sources, "sections": self.sections}, indent=2) + "\n")
+        html_path.write_text(self._html(meta), encoding="utf-8")
+        for theme, path in (("light", light), ("dark", dark)): self._pdf(path, theme, meta)
+        return {"report_pdf": light, "report_pdf_dark": dark, "report_html": html_path, "manifest_json": manifest, "figures_dir": self.figdir}
+
+    def _html(self, meta):
+        esc = lambda x: html.escape(str(x), quote=True)
+        alerts = self.issues or [{"severity":"ok","title":"No automated issues detected","detail":"Visual review remains required."}]
+        cards = "".join(f'<div class="alert {esc(x["severity"])}"><b>{esc(x["title"])}</b><p>{esc(x["detail"])}</p></div>' for x in alerts)
+        body = []
+        for sec in self.sections:
+            figs = "".join(f'<article><h3>{esc(f["title"])}</h3><img class="light" src="figures/{esc(f["light"])}"><img class="dark" src="figures/{esc(f["dark"])}"><p>{esc(f["caption"])}</p></article>' for f in sec["figures"])
+            notes = "".join(f'<p class="note">{esc(n)}</p>' for n in sec["notes"])
+            body.append(f'<section><h2>{esc(sec["title"])}</h2><p>{esc(sec["intro"])}</p>{notes}<div class="grid">{figs}</div></section>')
+        return f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>CMC ex-vivo QA</title><style>body{{--bg:#f5f7fb;--paper:#fff;--fg:#172033;--sub:#586579;--line:#dfe5ee;margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui}}body[data-theme=dark]{{--bg:#0b1320;--paper:#111827;--fg:#f3f4f6;--sub:#aeb9c9;--line:#324053}}header{{padding:16px 3%;background:var(--paper);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:2}}button{{float:right}}main{{max-width:1450px;margin:auto;padding:35px 3% 70px}}h1{{font-size:46px}}section{{padding-top:36px}}.grid,.alerts{{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,520px),1fr));gap:14px}}article,.alert,.note{{background:var(--paper);border:1px solid var(--line);border-radius:14px;padding:16px}}article img{{width:100%;background:#111827}}p{{color:var(--sub)}}.dark{{display:none}}body[data-theme=dark] .dark{{display:block}}body[data-theme=dark] .light{{display:none}}</style></head><body data-theme="light"><header><b>CMC · EX-VIVO DWI QA</b><button onclick="document.body.dataset.theme=document.body.dataset.theme==='dark'?'light':'dark'">Light / dark</button></header><main><h1>{esc(self.root.parent.name)}</h1><p>{esc(self.acqtype.upper())} · {esc(self.mode.upper())} · {esc(self.inputs.run_mode)}</p><h2>Action needed and caveats</h2><div class="alerts">{cards}</div>{''.join(body)}<p><a href="QA_manifest.json">QA manifest</a></p></main></body></html>'''
+
+    def _pdf(self, path, theme, meta):
+        bg, fg, accent = self.THEMES[theme]
+        with PdfPages(path) as pdf:
+            fig = plt.figure(figsize=(13.33, 7.5), facecolor=bg); fig.text(.055,.86,"CMC / EX-VIVO DWI",color=accent,weight="bold"); fig.text(.055,.73,"Quality assurance",color=fg,fontsize=32,weight="bold"); fig.text(.055,.62,f"{self.acqtype.upper()} · {self.mode.upper()} · {self.inputs.run_mode}",color=fg,fontsize=18); fig.text(.055,.52,str(self.root),color=fg,fontsize=9); pdf.savefig(fig,facecolor=bg); plt.close(fig)
+            for sec in self.sections:
+                for item in sec["figures"]:
+                    image = self.figdir / item[theme]
+                    if not image.is_file(): continue
+                    fig=plt.figure(figsize=(13.33,7.5),facecolor=bg); fig.text(.05,.92,sec["title"].upper(),color=accent,weight="bold"); fig.text(.05,.86,item["title"],color=fg,fontsize=19); ax=fig.add_axes((.05,.17,.9,.64)); ax.imshow(plt.imread(image)); ax.axis("off"); fig.text(.05,.11,textwrap.fill(item["caption"],150),color=fg,fontsize=9); pdf.savefig(fig,facecolor=bg); plt.close(fig)

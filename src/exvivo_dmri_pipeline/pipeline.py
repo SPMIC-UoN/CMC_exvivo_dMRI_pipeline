@@ -299,11 +299,12 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
         qa.inputs.eddy_qc_json = os.path.join(eddy_root, "eddy.qc", "qc.json")
         # standard-space outline (generic, optional)
         qa.inputs.std_mask_img = getattr(cfg, "std_mask_file", None)
+        qa.inputs.std_fa_img = getattr(cfg, "std_fa_file", None)
 
-        # Core inputs
-        qa.inputs.data_4d = os.path.join(eddy_root, "eddy.nii.gz")
-        qa.inputs.bvals = os.path.join(eddy_root, "bvals")
-        qa.inputs.bvecs = os.path.join(eddy_root, "eddy.eddy_rotated_bvecs")
+        # Core inputs used downstream. EDDY is diagnostic-only ex vivo.
+        qa.inputs.data_4d = os.path.join(datadir, "data.nii.gz")
+        qa.inputs.bvals = os.path.join(datadir, "bvals")
+        qa.inputs.bvecs = os.path.join(datadir, "bvecs")
         qa.inputs.mask_file = os.path.join(datadir, "nodif_brain_mask.nii.gz")
 
         # add native FA/V1 if present
@@ -758,17 +759,18 @@ def build_workflow(cfg: Config, verbose: bool = False, run_mode: str = "preproc_
 
     qa.inputs.eddy_qc_json = os.path.join(eddy_root, "eddy.qc", "qc.json")
     qa.inputs.std_mask_img = getattr(cfg, "std_mask_file", None)  # generic standard outline mask
+    qa.inputs.std_fa_img = getattr(cfg, "std_fa_file", None)
 
-    # Diffusion inputs to QA
-    qa.inputs.data_4d = os.path.join(eddy_root, "eddy.nii.gz")
-    qa.inputs.bvals = os.path.join(eddy_root, "bvals")
-    qa.inputs.bvecs = os.path.join(eddy_root, "eddy.eddy_rotated_bvecs")
+    # Diffusion inputs actually used downstream; EDDY is run for QC only.
+    wf.connect(link_data, "out_path", qa, "data_4d")
+    wf.connect(sync_grads, "bvals_out", qa, "bvals")
+    wf.connect(sync_grads, "bvecs_out", qa, "bvecs")
     qa.inputs.mask_file = os.path.join(datadir, "nodif_brain_mask.nii.gz")
 
     # Native FA / V1
     wf.connect(dti_node, "fa_file", qa, "fa_img")
-    v1_native = os.path.join(datadir, "dti", "dti_V1.nii.gz")
-    qa.inputs.v1_img = v1_native
+    # V1 is discovered beside the connected FA output. This works for the
+    # default SSFP CUDIMOT directory and the optional SE dtifit directory.
 
     # XTRACT dir if built
     if xtract_node is not None:

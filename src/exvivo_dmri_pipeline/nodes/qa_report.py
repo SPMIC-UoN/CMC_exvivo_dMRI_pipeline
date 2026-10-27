@@ -5,6 +5,7 @@ import datetime
 import subprocess
 import html
 import shutil
+import shlex
 import textwrap
 from pathlib import Path
 
@@ -581,7 +582,7 @@ class QAReport(SimpleInterface):
 class _ModernReport:
     """HTML/dual-PDF report for pipeline-owned ex-vivo outputs."""
 
-    REPORT_VERSION = "2026-10-27.6"
+    REPORT_VERSION = "2026-10-27.7"
 
     THEMES = {
         "light": ("#ffffff", "#172033", "#3274a1"),
@@ -661,7 +662,9 @@ class _ModernReport:
         if names:
             section["figures"].append({"title": title, "caption": caption,
                 "light": names.get("light") or names.get("dark"),
-                "dark": names.get("dark") or names.get("light")})
+                "dark": names.get("dark") or names.get("light"),
+                "sources": [str(path) for _, path, _ in rows] +
+                           [str(item[0]) for item in (masks or []) if item]})
 
     def _read_config(self):
         config = self.source("config", self.value("pipeline_yaml"), self.root / "config_used.yaml")
@@ -737,22 +740,50 @@ class _ModernReport:
         if not qcpath: section["notes"].append("EDDY QUAD output was unavailable."); return
         try: qc = json.loads(qcpath.read_text())
         except Exception as exc: self.issue("error", "Cannot parse EDDY QC", exc); return
-        values = qc.get("qc_cnr_avg") or []; shells = qc.get("data_unique_bvals") or qc.get("b_shells") or []
+        values = qc.get("qc_cnr_avg") or []
+        shells = [shell for shell in
+                  (qc.get("data_unique_bvals") or qc.get("b_shells") or [])
+                  if float(shell) > 0]
         if not values: section["notes"].append("No QUAD SNR/CNR values were present."); return
         for theme, (bg, fg, _) in self.THEMES.items():
             out = self.figdir / f"eddy_signal_{theme}.png"
-            with plt.rc_context({"figure.facecolor": bg, "axes.facecolor": bg, "text.color": fg}):
-                fig, axes = plt.subplots((len(values)+1)//2, 2, figsize=(14, max(5, 3.5*((len(values)+1)//2))), squeeze=False, layout="constrained")
-                for i, ax in enumerate(axes.flat):
-                    ax.axis("off")
-                    if i >= len(values): continue
-                    shell = shells[i] if i < len(shells) else None
-                    label = "b0 SNR" if i == 0 or shell == 0 else f"b={shell} CNR"
-                    ax.set_title(f"{label}: {values[i]:.2f}", color=fg)
-                    png = qcpath.parent / f"cnr{i:04d}.nii.gz.png"
-                    if png.is_file(): ax.imshow(plt.imread(png))
+            with plt.rc_context({"figure.facecolor": bg, "axes.facecolor": bg,
+                                 "text.color": fg, "axes.labelcolor": fg,
+                                 "xtick.color": fg, "ytick.color": fg}):
+                fig, axes = plt.subplots(len(values), 3,
+                                         figsize=(15, max(6, 3.45 * len(values))),
+                                         squeeze=False, layout="constrained")
+                fig.suptitle("EDDY QUAD - SNR and CNR", fontsize=19, weight="semibold")
+                for i in range(len(values)):
+                    shell = shells[i - 1] if i > 0 and i - 1 < len(shells) else None
+                    label = "b0 SNR" if i == 0 else (
+                        f"b={shell} CNR" if shell is not None else f"Shell {i} CNR")
+                    nii = qcpath.parent / f"cnr{i:04d}.nii.gz"
+                    if nii.is_file():
+                        data = self.volume(nii)
+                        finite = data[np.isfinite(data) & (data >= 0)]
+                        vmax = float(np.percentile(finite, 99)) if finite.size else 1
+                        artist = None
+                        for column, view in enumerate(self.views(data)):
+                            artist = axes[i, column].imshow(
+                                view, cmap="viridis", vmin=0, vmax=vmax,
+                                interpolation="nearest")
+                            axes[i, column].set_title(
+                                ("Sagittal", "Coronal", "Axial")[column] if i == 0 else "")
+                            axes[i, column].axis("off")
+                        axes[i, 0].set_ylabel(f"{label}\nmean {values[i]:.2f}",
+                                              color=fg, weight="semibold")
+                        colourbar = fig.colorbar(artist, ax=axes[i, :],
+                                                fraction=.018, pad=.012)
+                        colourbar.set_label("SNR" if i == 0 else "CNR", color=fg)
+                    else:
+                        png = qcpath.parent / f"cnr{i:04d}.nii.gz.png"
+                        for axis in axes[i, :]: axis.axis("off")
+                        if png.is_file(): axes[i, 1].imshow(plt.imread(png))
+                        else: axes[i, 1].text(.5, .5, "Spatial map unavailable",
+                                                  ha="center", va="center", color=fg)
                 fig.savefig(out, dpi=165, facecolor=bg); plt.close(fig)
-        section["figures"].append({"title": "b0 SNR and shell CNR", "caption": "EDDY is diagnostic-only in this pipeline.", "light": "eddy_signal_light.png", "dark": "eddy_signal_dark.png"})
+        section["figures"].append({"title": "b0 SNR and shell CNR", "caption": "EDDY is diagnostic-only in this pipeline.", "light": "eddy_signal_light.png", "dark": "eddy_signal_dark.png", "sources": [str(qcpath), *(str(qcpath.parent / f"cnr{i:04d}.nii.gz") for i in range(len(values)))]})
 
     def _final_maps(self):
         data = self.source("final_data", self.value("data_4d"), self.root / "data" / "data.nii.gz")
@@ -783,6 +814,7 @@ class _ModernReport:
                     "title": "FA in standard space with template WM outline",
                     "caption": "Red outline is the configured standard-space FA template thresholded at FA > 0.2. Inspect cortical, callosal, brainstem and cerebellar agreement.",
                     "light": output.name, "dark": output.name,
+                    "sources": [str(subject), str(reference)],
                 })
             except Exception as exc:
                 self.issue("warning", "Could not render FSLeyes registration overlay", exc)
@@ -910,6 +942,8 @@ class _ModernReport:
                                f"{metrics['field_p05_p50_p95'][0]:.2f}–"
                                f"{metrics['field_p05_p50_p95'][2]:.2f}.",
                     "light": names["light"], "dark": names["dark"],
+                    "sources": [str(mean_path), str(mask), str(field), str(ratio),
+                                str(product / "low_signal_score.nii.gz")],
                 })
         except Exception as exc:
             self.issue("warning", "Signal-uniformity QA unavailable", exc)
@@ -919,19 +953,24 @@ class _ModernReport:
         field, ratio = self.volume(field_path), self.volume(ratio_path)
         bg, fg, _ = self.THEMES[theme]
         with plt.rc_context({"figure.facecolor": bg, "axes.facecolor": bg,
-                             "text.color": fg, "axes.labelcolor": fg}):
+                             "text.color": fg, "axes.labelcolor": fg,
+                             "xtick.color": fg, "ytick.color": fg}):
             fig, axes = plt.subplots(2, 3, figsize=(15, 7), layout="constrained")
             fig.suptitle(f"Spatial signal uniformity: b={shell}", fontsize=18,
                          weight="semibold")
             for row, (label, image) in enumerate((
                     ("Smooth field", field), ("Observed / expected", ratio))):
+                artist = None
                 for column, view in enumerate(self.views(image)):
-                    axes[row, column].imshow(view, cmap="coolwarm", vmin=.5, vmax=1.5,
-                                             interpolation="nearest")
+                    artist = axes[row, column].imshow(
+                        view, cmap="coolwarm", vmin=.5, vmax=1.5,
+                        interpolation="nearest")
                     axes[row, column].set_title(
                         ("Sagittal", "Coronal", "Axial")[column] if row == 0 else "")
                     axes[row, column].set_ylabel(label, color=fg, weight="semibold")
                     axes[row, column].axis("off")
+                colourbar = fig.colorbar(artist, ax=axes[row, :], fraction=.018, pad=.012)
+                colourbar.set_label("Relative signal (median = 1)", color=fg)
             fig.savefig(output, dpi=165, facecolor=bg); plt.close(fig)
 
     def _tensor_panel(self, section, fa, md, v1):
@@ -976,6 +1015,7 @@ class _ModernReport:
                 "caption": "FA and MD use independent display scales. V1 colour encodes absolute principal direction and FA modulates brightness.",
                 "light": names.get("light") or names.get("dark"),
                 "dark": names.get("dark") or names.get("light"),
+                "sources": [str(fa), str(md), str(v1)],
             })
 
     def _xtract_density_panel(self, section, tracts):
@@ -1040,7 +1080,7 @@ class _ModernReport:
         # images) when a report is regenerated in the same output directory.
         if self.figdir.is_dir():
             shutil.rmtree(self.figdir)
-        self.figdir.mkdir(parents=True, exist_ok=True); self._read_config(); self._stages(); self._eddy(); self._final_maps(); self._signal_uniformity(); self._xtract()
+        self.figdir.mkdir(parents=True, exist_ok=True); self._read_config(); self._stages(); self._eddy(); self._signal_uniformity(); self._final_maps(); self._xtract()
         return self._write()
 
     def _write(self):
@@ -1070,10 +1110,72 @@ class _ModernReport:
         cards = "".join(f'<div class="alert {esc(x["severity"])}"><b>{esc(x["title"])}</b><p>{esc(x["detail"])}</p></div>' for x in alerts)
         body = []
         for sec in self.sections:
-            figs = "".join(f'<article><h3>{esc(f["title"])}</h3><img class="light" src="figures/{esc(f["light"])}"><img class="dark" src="figures/{esc(f["dark"])}"><p>{esc(f["caption"])}</p></article>' for f in sec["figures"])
+            figures = []
+            for figure in sec["figures"]:
+                sources = figure.get("sources", [])
+                launch = self._fsleyes_launch_command(sources)
+                source_html = "".join(f"<li>{esc(path)}</li>" for path in sources)
+                figures.append(
+                    f'<article><h3>{esc(figure["title"])}</h3>'
+                    f'<img class="light" src="figures/{esc(figure["light"])}">'
+                    f'<img class="dark" src="figures/{esc(figure["dark"])}">'
+                    f'<p>{esc(figure["caption"])}</p>'
+                    + (f'<details><summary>Source files</summary><ul>{source_html}</ul></details>'
+                       if source_html else "")
+                    + (f'<details><summary>Launch interactive view</summary>'
+                       f'<p>Copy into a terminal on the processing host:</p>'
+                       f'<pre><code>{esc(launch)}</code></pre></details>' if launch else "")
+                    + '</article>')
+            figs = "".join(figures)
             notes = "".join(f'<p class="note">{esc(n)}</p>' for n in sec["notes"])
             body.append(f'<section><h2>{esc(sec["title"])}</h2><p>{esc(sec["intro"])}</p>{notes}<div class="grid">{figs}</div></section>')
-        return f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>CMC ex-vivo QA</title><style>body{{--bg:#f5f7fb;--paper:#fff;--fg:#172033;--sub:#586579;--line:#dfe5ee;margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui}}body[data-theme=dark]{{--bg:#0b1320;--paper:#111827;--fg:#f3f4f6;--sub:#aeb9c9;--line:#324053}}header{{padding:16px 3%;background:var(--paper);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:2}}button{{float:right}}main{{max-width:1450px;margin:auto;padding:35px 3% 70px}}h1{{font-size:46px}}section{{padding-top:36px}}.grid,.alerts{{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,520px),1fr));gap:14px}}article,.alert,.note{{background:var(--paper);border:1px solid var(--line);border-radius:14px;padding:16px}}article img{{width:100%;background:#111827}}p{{color:var(--sub)}}.dark{{display:none}}body[data-theme=dark] .dark{{display:block}}body[data-theme=dark] .light{{display:none}}</style></head><body data-theme="light"><header><b>CMC · EX-VIVO DWI QA</b><button onclick="document.body.dataset.theme=document.body.dataset.theme==='dark'?'light':'dark'">Light / dark</button></header><main><h1>{esc(self.root.parent.name)}</h1><p>{esc(self.acqtype.upper())} · {esc(self.mode.upper())} · {esc(self.inputs.run_mode)}</p><h2>Action needed and caveats</h2><div class="alerts">{cards}</div>{''.join(body)}<p><a href="QA_manifest.json">QA manifest</a></p></main></body></html>'''
+        return f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>CMC ex-vivo QA</title><style>body{{--bg:#f5f7fb;--paper:#fff;--fg:#172033;--sub:#586579;--line:#dfe5ee;margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui}}body[data-theme=dark]{{--bg:#0b1320;--paper:#111827;--fg:#f3f4f6;--sub:#aeb9c9;--line:#324053}}header{{padding:16px 3%;background:var(--paper);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:2}}button{{float:right}}main{{max-width:1450px;margin:auto;padding:35px 3% 70px}}h1{{font-size:46px}}section{{padding-top:36px}}.grid,.alerts{{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,520px),1fr));gap:14px}}article,.alert,.note{{background:var(--paper);border:1px solid var(--line);border-radius:14px;padding:16px}}article img{{width:100%;background:#111827}}p{{color:var(--sub)}}details{{color:var(--sub);font-size:12px}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;background:var(--bg);border:1px solid var(--line);padding:11px;border-radius:8px;color:var(--fg);user-select:all}}.dark{{display:none}}body[data-theme=dark] .dark{{display:block}}body[data-theme=dark] .light{{display:none}}</style></head><body data-theme="light"><header><b>CMC · EX-VIVO DWI QA</b><button onclick="document.body.dataset.theme=document.body.dataset.theme==='dark'?'light':'dark'">Light / dark</button></header><main><h1>{esc(self.root.parent.name)}</h1><p>{esc(self.acqtype.upper())} · {esc(self.mode.upper())} · {esc(self.inputs.run_mode)}</p><h2>Action needed and caveats</h2><div class="alerts">{cards}</div>{''.join(body)}<p><a href="QA_manifest.json">QA manifest</a></p></main></body></html>'''
+
+    def _fsleyes_launch_command(self, sources):
+        paths = []
+        for source in sources:
+            value = str(source)
+            if (value.endswith((".nii", ".nii.gz")) and Path(value).is_file()
+                    and value not in paths):
+                paths.append(value)
+        if not paths:
+            return ""
+        command = ["fsleyes"]
+        tract_options = {}
+        for view in ("sagittal", "coronal", "axial"):
+            for tract, cmap, low, high in _ModernReport._xtract_view_spec(view):
+                tract_options.setdefault(tract, (cmap, low, high))
+        for path in paths:
+            name = Path(path).name.lower()
+            tract = Path(path).parent.name
+            command += [path, "--name", Path(path).name.removesuffix(".nii.gz")]
+            if "smooth_signal_field" in name or "observed_expected_ratio" in name:
+                command += ["--cmap", "coolwarm", "--displayRange", ".5", "1.5"]
+            elif "low_signal_score" in name:
+                command += ["--cmap", "hot", "--displayRange", "0", "1"]
+            elif "cnr" in name:
+                command += ["--cmap", "viridis", "--displayRange", "0", "99%"]
+            elif "mask" in name:
+                command += ["--overlayType", "mask", "--maskColour", "1", "0", "0",
+                            "--outline", "--outlineWidth", "2"]
+            elif "densitynorm" in name:
+                cmap, low, high = tract_options.get(tract, ("red-yellow", .001, .1))
+                command += ["--overlayType", "mip", "--cmap", cmap,
+                            "--displayRange", str(low), str(high)]
+            elif "_v1" in name:
+                command += ["--overlayType", "rgbvector"]
+            elif "_md" in name:
+                command += ["--cmap", "greyscale", "--displayRange", "0", ".003"]
+            elif "nmt_fa" in name or "hcp1065_fa" in name:
+                threshold = ".1" if self.mode == "hum" else ".2"
+                command += ["--overlayType", "mask", "--maskColour", "1", "0", "0",
+                            "--maskInvert", "--threshold", "0", threshold,
+                            "--outline", "--outlineWidth", "3"]
+            elif "_fa" in name or "fa_" in name:
+                command += ["--cmap", "greyscale", "--displayRange", "0", "1"]
+            else:
+                command += ["--cmap", "greyscale", "--displayRange", "0", "99%"]
+        return shlex.join(command) + " &"
 
     def _pdf(self, path, theme, meta):
         bg, fg, accent = self.THEMES[theme]

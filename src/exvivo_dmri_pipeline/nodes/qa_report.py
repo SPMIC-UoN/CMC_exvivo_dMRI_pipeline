@@ -14,6 +14,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
+import yaml
 
 from nipype.interfaces.base import (
     BaseInterfaceInputSpec,
@@ -578,6 +579,8 @@ class QAReport(SimpleInterface):
 class _ModernReport:
     """HTML/dual-PDF report for pipeline-owned ex-vivo outputs."""
 
+    REPORT_VERSION = "2026-10-27.2"
+
     THEMES = {
         "light": ("#ffffff", "#172033", "#3274a1"),
         "dark": ("#111827", "#f3f4f6", "#60a5fa"),
@@ -590,7 +593,8 @@ class _ModernReport:
         self.figdir = self.out / "figures"
         self.sections, self.issues, self.sources = [], [], {}
         self.config = {}
-        self.acqtype, self.mode = "ssfp", "unknown"  # SSFP is the pipeline default.
+        # Match Config defaults when optional YAML keys are absent.
+        self.acqtype, self.mode = "ssfp", "nhp"
 
     def value(self, name):
         value = getattr(self.inputs, name)
@@ -665,16 +669,30 @@ class _ModernReport:
         try:
             self.config = {str(k).lower(): v for k, v in (yaml.safe_load(config.read_text()) or {}).items()}
             self.acqtype = str(self.config.get("acqtype", "ssfp")).lower()
-            self.mode = str(self.config.get("mode", "unknown")).lower()
+            self.mode = str(self.config.get("mode", "nhp")).lower()
         except Exception as exc:
             self.issue("error", "Cannot read saved configuration", exc)
 
     def _config_data(self):
-        value = (self.config.get("data_paths") or {}).get("data_nii")
-        if not value: return None
-        path = Path(value).expanduser()
         base = Path(self.sources["config"]).parent if "config" in self.sources else Path.cwd()
-        return path if path.is_absolute() else base / path
+        value = (self.config.get("data_paths") or {}).get("data_nii")
+        if value:
+            path = Path(value).expanduser()
+            return path if path.is_absolute() else base / path
+
+        # Config expands input_dir into conventional inputs when data_paths is
+        # omitted. Mirror that behaviour for saved minimal configurations.
+        input_dir = self.config.get("input_dir")
+        if input_dir:
+            path = Path(input_dir).expanduser()
+            path = path if path.is_absolute() else base / path
+            candidate = path / "data.nii.gz"
+            if candidate.is_file():
+                return candidate
+
+        # Final fallback is the raw copy produced by the SSFP onboarding node.
+        candidate = self.root / "data_raw" / "data.nii.gz"
+        return candidate if candidate.is_file() else None
 
     def _stages(self):
         raw = self.source("raw_data", self._config_data())
@@ -690,22 +708,33 @@ class _ModernReport:
                                 self.root / "gibbs" / f"{stem}_gibbs2d.nii.gz")
         else: gibbs = None
         pairs.append(("Gibbs unringing", current, gibbs, "Check high-contrast boundaries for reduced ringing without blurring."))
-        drift = self.source("temporal_drift_data", self.root / "drift_correction" / "data_corrected.nii.gz")
-        pairs.append(("Temporal drift correction", gibbs, drift, "Representative matched volume before and after temporal correction."))
-        spatial = self.source("spatial_drift_data", self.root / "data_spatial_drift" / "data_reg.nii.gz")
-        if bool(self.config.get("run_spatial_drift", True)):
-            pairs.append(("Spatial drift correction", drift, spatial, "Representative matched volume before and after within-series alignment."))
         for number, (title, before, after, caption) in enumerate(pairs):
             section = self.section(title, caption)
             if before and after:
                 self.add_panel(section, f"stage_{number}", title, caption,
                                [("Before", before, 0), ("After", after, 0)])
             else: section["notes"].append("Required pipeline-owned before/after files were unavailable.")
-            if title == "Temporal drift correction":
-                plot = self.source("temporal_drift_plot", self.root / "drift_correction" / "drift_plot.png")
-                if plot:
-                    dst = self.figdir / "temporal_drift_metrics.png"; shutil.copy2(plot, dst)
-                    section["figures"].append({"title": "Temporal drift model", "caption": "Pipeline-generated drift fit and assessment.", "light": dst.name, "dark": dst.name})
+
+        # Drift QA is represented by the diagnostic plot produced by the
+        # temporal-drift node. Spatial-drift before/after images are deliberately
+        # omitted: they add report bulk without a clear ex-vivo acceptance test.
+        section = self.section(
+            "Temporal drift correction",
+            "Pipeline-generated temporal signal-drift fit and correction assessment.",
+        )
+        plot = self.source(
+            "temporal_drift_plot", self.root / "drift_correction" / "drift_plot.png"
+        )
+        if plot:
+            dst = self.figdir / "temporal_drift_metrics.png"
+            shutil.copy2(plot, dst)
+            section["figures"].append({
+                "title": "Temporal drift model",
+                "caption": "Pipeline-generated drift fit and correction assessment.",
+                "light": dst.name, "dark": dst.name,
+            })
+        else:
+            section["notes"].append("The pipeline temporal-drift plot was unavailable.")
 
     def _eddy(self):
         section = self.section("EDDY signal quality", "QUAD signal/CNR metrics only. Motion and EDDY-corrected images are intentionally excluded for fixed tissue.")
@@ -747,11 +776,53 @@ class _ModernReport:
             if not v1: tensor["notes"].append("V1 was not found beside the pipeline FA output.")
         else: tensor["notes"].append("Pipeline FA output was unavailable.")
 
-        reg = self.section("Standard-space registration", "Subject FA compared with the configured standard-space FA template.")
+        reg = self.section("Standard-space registration", "Subject FA with the configured template FA > 0.2 outlined in red.")
         subject = self.source("fa_standard", self.root / "stdreg" / "FA_in_STD.nii.gz")
         reference = self.source("fa_template", self.value("std_fa_img"))
-        if subject and reference: self.add_panel(reg, "registration", "Subject and template FA", "Inspect cortical, callosal, brainstem and cerebellar agreement.", [("Subject FA", subject, 0), ("Template FA", reference, 0)])
-        else: reg["notes"].append("Subject or template standard-space FA was unavailable.")
+        if subject and reference:
+            try:
+                output = self.figdir / "registration_fsleyes.png"
+                self._registration_fsleyes(subject, reference, output)
+                reg["figures"].append({
+                    "title": "FA in standard space with template WM outline",
+                    "caption": "Red outline is the configured standard-space FA template thresholded at FA > 0.2. Inspect cortical, callosal, brainstem and cerebellar agreement.",
+                    "light": output.name, "dark": output.name,
+                })
+            except Exception as exc:
+                self.issue("warning", "Could not render FSLeyes registration overlay", exc)
+                reg["notes"].append("FSLeyes registration rendering failed; see the issue summary.")
+        else:
+            reg["notes"].append("Subject or template standard-space FA was unavailable.")
+
+    @staticmethod
+    def _registration_fsleyes(subject, reference, output):
+        executable = shutil.which("fsleyes")
+        if not executable:
+            raise FileNotFoundError("fsleyes was not found on PATH")
+        ref_img = nib.load(str(reference))
+        ref_data = np.asarray(ref_img.dataobj)
+        coords = np.argwhere(np.isfinite(ref_data) & (ref_data > 0.2))
+        centre = coords.mean(axis=0) if coords.size else np.asarray(ref_img.shape[:3]) / 2
+        world = nib.affines.apply_affine(ref_img.affine, centre)
+        command = [
+            executable, "render", "--outfile", str(output), "--size", "2400", "900",
+            "--scene", "ortho", "--worldLoc", *(f"{value:.8f}" for value in world),
+            "--displaySpace", str(reference),
+            "--xzoom", "100", "--yzoom", "100", "--zzoom", "100",
+            "--hideLabels", "--showLocation", "no", "--layout", "horizontal",
+            "--hideCursor", "--bgColour", "0", "0", "0", "--fgColour", "1", "1", "1",
+            str(subject), "--name", "FA_in_STD", "--overlayType", "volume",
+            "--alpha", "100", "--cmap", "greyscale", "--displayRange", "0", "1",
+            "--interpolation", "none", "--volume", "0",
+            str(reference), "--name", "Template_FA", "--overlayType", "mask",
+            "--alpha", "100", "--maskColour", "1", "0", "0", "--maskInvert",
+            "--threshold", "0", "0.2", "--outline", "--outlineWidth", "3",
+            "--interpolation", "none", "--volume", "0",
+        ]
+        subprocess.run(command, check=True, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, text=True)
+        if not output.is_file() or not output.stat().st_size:
+            raise RuntimeError("FSLeyes completed without creating the registration PNG")
 
     def _xtract(self):
         section = self.section("XTRACT overview", "Only the pipeline xtract directory is included; xtract.*, TDI and comparison directories are ignored.")
@@ -764,6 +835,10 @@ class _ModernReport:
         if not section["figures"]: section["notes"].append("XTRACT was not requested or viewer outputs were unavailable.")
 
     def build(self):
+        # Avoid leaving obsolete panels (for example the removed spatial-drift
+        # images) when a report is regenerated in the same output directory.
+        if self.figdir.is_dir():
+            shutil.rmtree(self.figdir)
         self.figdir.mkdir(parents=True, exist_ok=True); self._read_config(); self._stages(); self._eddy(); self._final_maps(); self._xtract()
         return self._write()
 
@@ -771,7 +846,18 @@ class _ModernReport:
         stamp = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
         html_path, light, dark = self.out / "CMC_exvivo_QA.html", self.out / "CMC_exvivo_QA.pdf", self.out / "CMC_exvivo_QA_dark.pdf"
         manifest = self.out / "QA_manifest.json"
-        meta = {"generated": stamp, "root": str(self.root), "acqtype": self.acqtype, "mode": self.mode, "run_mode": self.inputs.run_mode}
+        selected_config = {
+            key: self.config.get(key) for key in (
+                "input_dir", "brain_mask", "run_denoise", "denoise_method",
+                "run_gibbs", "run_eddy", "run_eddy_qc", "run_spatial_drift",
+                "dti_approx_b", "dti_db", "dti_b0", "reg_method",
+                "xtract_species", "xtract_profiles_dir",
+            ) if key in self.config
+        }
+        meta = {"report_version": self.REPORT_VERSION, "generated": stamp,
+                "root": str(self.root), "acqtype": self.acqtype,
+                "mode": self.mode, "run_mode": self.inputs.run_mode,
+                "selected_config": selected_config}
         manifest.write_text(json.dumps({"metadata": meta, "issues": self.issues, "sources": self.sources, "sections": self.sections}, indent=2) + "\n")
         html_path.write_text(self._html(meta), encoding="utf-8")
         for theme, path in (("light", light), ("dark", dark)): self._pdf(path, theme, meta)

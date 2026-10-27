@@ -26,6 +26,8 @@ from nipype.interfaces.base import (
     isdefined,
 )
 
+from .signal_uniformity import process_image as process_signal_uniformity
+
 
 class QAReportInputSpec(BaseInterfaceInputSpec):
     # General
@@ -579,7 +581,7 @@ class QAReport(SimpleInterface):
 class _ModernReport:
     """HTML/dual-PDF report for pipeline-owned ex-vivo outputs."""
 
-    REPORT_VERSION = "2026-10-27.4"
+    REPORT_VERSION = "2026-10-27.6"
 
     THEMES = {
         "light": ("#ffffff", "#172033", "#3274a1"),
@@ -835,19 +837,102 @@ class _ModernReport:
     def _xtract(self):
         section = self.section("XTRACT overview", "Only the pipeline xtract directory is included; xtract.*, TDI and comparison directories are ignored.")
         xdir = Path(self.value("xtract_dir") or self.root / "xtract")
-        for name in ("xtract_sagittal.png", "xtract_coronal.png", "xtract_axial.png"):
-            src = xdir / name
-            if src.is_file():
-                dst = self.figdir / name; shutil.copy2(src, dst)
-                section["figures"].append({"title": src.stem.replace("xtract_", "").title(), "caption": "Pipeline viewer export.", "light": dst.name, "dark": dst.name})
-        if not section["figures"]:
-            tracts = sorted((xdir / "tracts").glob("*/densityNorm.nii.gz"))
-            if tracts:
-                self.sources["xtract_dir"] = str(xdir.resolve())
-                self.sources["xtract_tract_count"] = len(tracts)
-                self._xtract_density_panel(section, tracts)
-            else:
-                section["notes"].append("The selected XTRACT directory contained no viewer PNGs or normalised tract-density maps.")
+        tracts = sorted((xdir / "tracts").glob("*/densityNorm.nii.gz"))
+        if tracts:
+            self.sources["xtract_dir"] = str(xdir.resolve())
+            self.sources["xtract_tract_count"] = len(tracts)
+            self._xtract_density_panel(section, tracts)
+        else:
+            section["notes"].append("The selected XTRACT directory contained no normalised tract-density maps.")
+
+    @staticmethod
+    def _shell_groups(values, tolerance):
+        remaining = sorted(float(value) for value in np.unique(values))
+        groups = []
+        while remaining:
+            group = [remaining.pop(0)]
+            while remaining and remaining[0] - np.mean(group) <= tolerance:
+                group.append(remaining.pop(0))
+            groups.append(group)
+        return {int(round(np.mean(group) / 10) * 10):
+                np.flatnonzero(np.isin(values, group)) for group in groups}
+
+    def _signal_uniformity(self):
+        section = self.section(
+            "Spatial signal uniformity",
+            "A broad log-domain smooth field is estimated independently for each final "
+            "shell average inside the pipeline mask. It describes dMRI signal variation "
+            "without assigning a specific physical cause.")
+        data = self.source("uniformity_data", self.value("data_4d"),
+                           self.root / "data" / "data.nii.gz")
+        bvals = self.source("uniformity_bvals", self.value("bvals"),
+                            self.root / "data" / "bvals")
+        mask = self.source("uniformity_mask", self.value("mask_file"),
+                           self.root / "data" / "nodif_brain_mask.nii.gz")
+        if not data or not bvals or not mask:
+            section["notes"].append("Final data, b-values or pipeline mask was unavailable.")
+            return
+        try:
+            values = np.loadtxt(bvals, dtype=float).reshape(-1)
+            shape = nib.load(str(data)).shape
+            if len(shape) != 4 or shape[3] != len(values):
+                raise ValueError(f"data shape={shape}, b-values={len(values)}")
+            tolerance = float(self.config.get("dti_db", 60))
+            averages = self.out / "shell_averages"; averages.mkdir(parents=True, exist_ok=True)
+            select, maths = shutil.which("fslselectvols"), shutil.which("fslmaths")
+            if not select or not maths:
+                raise FileNotFoundError("fslselectvols or fslmaths was not found on PATH")
+            for shell, indices in sorted(self._shell_groups(values, tolerance).items()):
+                mean_path = averages / f"b{shell}_mean.nii.gz"
+                if not mean_path.is_file():
+                    selected = averages / f".b{shell}_selected.nii.gz"
+                    subprocess.run([select, "-i", str(data), "-o", str(selected),
+                                    "--vols=" + ",".join(map(str, indices))], check=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    subprocess.run([maths, str(selected), "-Tmean", str(mean_path)],
+                                   check=True, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True)
+                    selected.unlink(missing_ok=True)
+                metrics = process_signal_uniformity(
+                    mean_path, self.out / "signal_uniformity", mask, 30.0)
+                product = self.out / "signal_uniformity" / f"b{shell}_mean"
+                field = product / "smooth_signal_field.nii.gz"
+                ratio = product / "observed_expected_ratio.nii.gz"
+                names = {}
+                for theme in self.THEMES:
+                    output = self.figdir / f"signal_uniformity_b{shell}_{theme}.png"
+                    self._uniformity_panel(field, ratio, shell, output, theme)
+                    names[theme] = output.name
+                section["figures"].append({
+                    "title": f"b={shell} signal uniformity",
+                    "caption": "Top: median-normalised smooth signal field. Bottom: "
+                               "observed/local-expected ratio. Field 5th–95th percentiles: "
+                               f"{metrics['field_p05_p50_p95'][0]:.2f}–"
+                               f"{metrics['field_p05_p50_p95'][2]:.2f}.",
+                    "light": names["light"], "dark": names["dark"],
+                })
+        except Exception as exc:
+            self.issue("warning", "Signal-uniformity QA unavailable", exc)
+            section["notes"].append("Signal-uniformity processing failed; see the issue summary.")
+
+    def _uniformity_panel(self, field_path, ratio_path, shell, output, theme):
+        field, ratio = self.volume(field_path), self.volume(ratio_path)
+        bg, fg, _ = self.THEMES[theme]
+        with plt.rc_context({"figure.facecolor": bg, "axes.facecolor": bg,
+                             "text.color": fg, "axes.labelcolor": fg}):
+            fig, axes = plt.subplots(2, 3, figsize=(15, 7), layout="constrained")
+            fig.suptitle(f"Spatial signal uniformity: b={shell}", fontsize=18,
+                         weight="semibold")
+            for row, (label, image) in enumerate((
+                    ("Smooth field", field), ("Observed / expected", ratio))):
+                for column, view in enumerate(self.views(image)):
+                    axes[row, column].imshow(view, cmap="coolwarm", vmin=.5, vmax=1.5,
+                                             interpolation="nearest")
+                    axes[row, column].set_title(
+                        ("Sagittal", "Coronal", "Axial")[column] if row == 0 else "")
+                    axes[row, column].set_ylabel(label, color=fg, weight="semibold")
+                    axes[row, column].axis("off")
+            fig.savefig(output, dpi=165, facecolor=bg); plt.close(fig)
 
     def _tensor_panel(self, section, fa, md, v1):
         names = {}
@@ -894,58 +979,68 @@ class _ModernReport:
             })
 
     def _xtract_density_panel(self, section, tracts):
-        preferred = ("cst_l", "cst_r", "atr_l", "atr_r", "fma", "fmi", "fx_l", "fx_r")
-        selected = sorted(tracts, key=lambda path: (
-            preferred.index(path.parent.name) if path.parent.name in preferred else 999,
-            path.parent.name,
-        ))[:8]
-        palette = np.asarray([[.38,.65,1],[1,.72,.25],[.21,.82,.61],[.97,.43,.48],
-                              [.68,.55,.96],[.99,.62,.35],[.30,.79,.89],[.93,.49,.80]])
-        names = {}
-        for theme, (bg, fg, _) in self.THEMES.items():
-            output = self.figdir / f"xtract_density_{theme}.png"
+        tract_map = {path.parent.name: path for path in tracts}
+        reference = self.source("xtract_standard_template", self.value("std_fa_img"))
+        if not reference:
+            self.issue("warning", "Could not render XTRACT overview",
+                       "The standard-space FA template was unavailable.")
+            return
+        for view in ("sagittal", "coronal", "axial"):
+            output = self.figdir / f"xtract_{view}.png"
             try:
-                reference = nib.load(str(selected[0])); rgb = None
-                for i, path in enumerate(selected):
-                    image = nib.load(str(path))
-                    if image.shape[:3] != reference.shape[:3] or not np.allclose(image.affine, reference.affine):
-                        from nibabel.processing import resample_from_to
-                        image = resample_from_to(image, (reference.shape[:3], reference.affine))
-                    data = np.asarray(image.dataobj, dtype=np.float32)
-                    nonzero = data[data > 0]
-                    if not nonzero.size: continue
-                    norm = np.clip(data / float(np.percentile(nonzero, 99)), 0, 1)[..., None]
-                    if rgb is None: rgb = np.zeros(data.shape + (3,), dtype=np.float32)
-                    rgb = np.maximum(rgb, norm * palette[i])
-                if rgb is None: raise ValueError("All selected tract-density maps were empty")
-                with plt.rc_context({"figure.facecolor": bg, "axes.facecolor": bg, "text.color": fg}):
-                    fig, axes = plt.subplots(1, 3, figsize=(16, 5.5), layout="constrained")
-                    fig.suptitle("XTRACT representative tract densities", fontsize=18, weight="semibold")
-                    for axis, title, image in zip(axes, ("Sagittal", "Coronal", "Axial"),
-                                                  (np.max(rgb, 0), np.max(rgb, 1), np.max(rgb, 2))):
-                        axis.imshow(np.rot90(image)); axis.set_title(title); axis.axis("off")
-                    from matplotlib.patches import Patch
-                    fig.legend([Patch(color=palette[i], label=path.parent.name)
-                                for i, path in enumerate(selected)], loc="lower center",
-                               ncol=4, frameon=False, labelcolor=fg)
-                    fig.savefig(output, dpi=165, facecolor=bg); plt.close(fig)
-                names[theme] = output.name
+                self._xtract_fsleyes(view, tract_map, reference, output)
+                if not output.is_file() or not output.stat().st_size:
+                    raise RuntimeError("FSLeyes did not create a PNG")
+                selected = [tract_map[name] for name, *_ in self._xtract_view_spec(view)
+                            if name in tract_map]
+                missing = [name for name, *_ in self._xtract_view_spec(view)
+                           if name not in tract_map]
+                if missing:
+                    section["notes"].append(
+                        f"{view.title()} panel omitted missing tracts: {', '.join(missing)}.")
+                section["figures"].append({
+                    "title": f"XTRACT {view} view",
+                    "caption": "Targeted tract-density MIPs on standard FA; the slice "
+                               "location is derived from template anatomy.",
+                    "light": output.name, "dark": output.name,
+                    "sources": [str(reference), *(str(path) for path in selected)],
+                })
             except Exception as exc:
-                self.issue("warning", f"Could not render XTRACT overview ({theme})", exc)
-        if names:
-            section["figures"].append({
-                "title": "Representative tract densities",
-                "caption": f"Maximum-intensity projections of {len(selected)} representative normalised tract-density maps.",
-                "light": names.get("light") or names.get("dark"),
-                "dark": names.get("dark") or names.get("light"),
-            })
+                self.issue("warning", f"Could not render XTRACT {view} view", exc)
+
+    @staticmethod
+    def _xtract_view_spec(view):
+        return {
+            "sagittal": (("mcp","red",.001,.05),("slf1_r","green",.005,.03),("cbd_r","blue",.003,.02),("cbp_r","yellow",.01,.2),("cst_r","fsleyes_hot",.003,.07),("cbt_r","blue-lightblue",.004,.1),("fx_r","fsleyes_copper",.005,.15),("vof_r","fsleyes_cool",.005,.05)),
+            "coronal": (("fx_r","fsleyes_copper",.005,.1),("fx_l","fsleyes_copper",.005,.1),("cst_r","fsleyes_hot",.001,.05),("cst_l","fsleyes_hot",.001,.05),("fa_l","fsleyes_cool",.001,.02),("fa_r","fsleyes_cool",.001,.02),("str_r","blue",.004,.025),("str_l","blue",.004,.025),("ar_r","yellow",.02,.1),("ar_l","yellow",.02,.1)),
+            "axial": (("fma","yellow",.005,.04),("fmi","yellow",.002,.01),("or_l","blue",.006,.05),("or_r","blue",.006,.05),("ac","green",.001,.1),("uf_l","blue-lightblue",.003,.02),("uf_r","blue-lightblue",.003,.02),("atr_r","fsleyes_cool",.005,.03),("atr_l","fsleyes_cool",.005,.03)),
+        }[view]
+
+    def _xtract_fsleyes(self, view, tract_map, reference, output):
+        executable = shutil.which("fsleyes")
+        if not executable:
+            raise FileNotFoundError("fsleyes was not found on PATH")
+        image = nib.load(str(reference)); data = np.asarray(image.dataobj)
+        coords = np.argwhere(np.isfinite(data) & (data > .1))
+        centre = coords.mean(0) if coords.size else np.asarray(image.shape[:3]) / 2
+        world = nib.affines.apply_affine(image.affine, centre)
+        if view == "sagittal" and coords.size:
+            points = nib.affines.apply_affine(image.affine, coords)
+            world[0] = (world[0] + float(points[:, 0].max())) / 2
+        hidden = {"sagittal": ("--hidey", "--hidez"), "coronal": ("--hidex", "--hidez"), "axial": ("--hidex", "--hidey")}[view]
+        command = [executable, "render", "--outfile", str(output), "--size", "1400", "1000", "--scene", "ortho", "--worldLoc", *(f"{v:.8f}" for v in world), "--displaySpace", str(reference), "--xzoom", "100", "--yzoom", "100", "--zzoom", "100", *hidden, "--hideLabels", "--showLocation", "no", "--hideCursor", str(reference), "--name", "Standard_FA", "--overlayType", "volume", "--brightness", "58", "--contrast", "65", "--cmap", "greyscale", "--displayRange", "0", ".5", "--interpolation", "spline"]
+        for name, cmap, low, high in self._xtract_view_spec(view):
+            tract = tract_map.get(name)
+            if tract:
+                command += [str(tract), "--name", name, "--overlayType", "mip", "--cmap", cmap, "--displayRange", str(low), str(high), "--interpolation", "spline"]
+        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
     def build(self):
         # Avoid leaving obsolete panels (for example the removed spatial-drift
         # images) when a report is regenerated in the same output directory.
         if self.figdir.is_dir():
             shutil.rmtree(self.figdir)
-        self.figdir.mkdir(parents=True, exist_ok=True); self._read_config(); self._stages(); self._eddy(); self._final_maps(); self._xtract()
+        self.figdir.mkdir(parents=True, exist_ok=True); self._read_config(); self._stages(); self._eddy(); self._final_maps(); self._signal_uniformity(); self._xtract()
         return self._write()
 
     def _write(self):

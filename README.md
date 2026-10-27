@@ -225,7 +225,13 @@ PROC/
   xtract/
     tracts/                 # containing xtract tract density maps
   QA/
-    QA_report.pdf
+    CMC_exvivo_QA.html          # interactive light/dark report
+    CMC_exvivo_QA.pdf           # light multi-page report
+    CMC_exvivo_QA_dark.pdf      # dark multi-page report
+    QA_manifest.json            # sources, issues and provenance
+    shell_averages/             # reusable means of final diffusion shells
+    signal_uniformity/          # smooth fields, signal ratios and metrics by shell
+    figures/                    # individual QA panels
   nipype_logging*/          # working directories and graph.png
 
 ```

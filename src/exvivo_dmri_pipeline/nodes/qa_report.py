@@ -579,7 +579,7 @@ class QAReport(SimpleInterface):
 class _ModernReport:
     """HTML/dual-PDF report for pipeline-owned ex-vivo outputs."""
 
-    REPORT_VERSION = "2026-10-27.3"
+    REPORT_VERSION = "2026-10-27.4"
 
     THEMES = {
         "light": ("#ffffff", "#172033", "#3274a1"),
@@ -798,6 +798,20 @@ class _ModernReport:
         coords = np.argwhere(np.isfinite(ref_data) & (ref_data > 0.2))
         centre = coords.mean(axis=0) if coords.size else np.asarray(ref_img.shape[:3]) / 2
         world = nib.affines.apply_affine(ref_img.affine, centre)
+        if coords.size:
+            # Choose a useful off-midline sagittal slice: halfway from the
+            # template midline towards the negative-X lateral brain boundary,
+            # while retaining centred coronal and axial locations.
+            lower, upper = coords.min(axis=0), coords.max(axis=0)
+            corners = np.asarray([
+                [x, y, z]
+                for x in (lower[0], upper[0])
+                for y in (lower[1], upper[1])
+                for z in (lower[2], upper[2])
+            ])
+            world_x = nib.affines.apply_affine(ref_img.affine, corners)[:, 0]
+            lateral, medial = float(world_x.min()), float((world_x.min() + world_x.max()) / 2)
+            world[0] = (lateral + medial) / 2
         command = [
             executable, "render", "--outfile", str(output), "--size", "2400", "900",
             "--scene", "ortho", "--worldLoc", *(f"{value:.8f}" for value in world),
@@ -858,7 +872,7 @@ class _ModernReport:
                     fig, axes = plt.subplots(3, 3, figsize=(15, 10.5), layout="constrained")
                     fig.suptitle("Lower-shell tensor maps", fontsize=18, weight="semibold")
                     rows = (("FA", fa_data, "gray", 1.0),
-                            ("MD", md_data, "magma", md_max),
+                            ("MD", md_data, "gray", md_max),
                             ("V1 × FA", rgb, None, None))
                     for i, (label, data, cmap, maximum) in enumerate(rows):
                         for j, view in enumerate(self.views(data)):

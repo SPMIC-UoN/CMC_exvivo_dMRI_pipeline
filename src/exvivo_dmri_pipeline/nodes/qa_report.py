@@ -745,21 +745,30 @@ class _ModernReport:
                   (qc.get("data_unique_bvals") or qc.get("b_shells") or [])
                   if float(shell) > 0]
         if not values: section["notes"].append("No QUAD SNR/CNR values were present."); return
+        numeric_maps = [qcpath.parent / f"cnr{i:04d}.nii.gz"
+                        for i in range(len(values))]
+        use_numeric_maps = all(path.is_file() for path in numeric_maps)
         for theme, (bg, fg, _) in self.THEMES.items():
             out = self.figdir / f"eddy_signal_{theme}.png"
             with plt.rc_context({"figure.facecolor": bg, "axes.facecolor": bg,
                                  "text.color": fg, "axes.labelcolor": fg,
                                  "xtick.color": fg, "ytick.color": fg}):
-                fig, axes = plt.subplots(len(values), 3,
-                                         figsize=(15, max(6, 3.45 * len(values))),
-                                         squeeze=False, layout="constrained")
+                if use_numeric_maps:
+                    fig, axes = plt.subplots(len(values), 3,
+                                             figsize=(15, max(6, 3.45 * len(values))),
+                                             squeeze=False, layout="constrained")
+                else:
+                    nrows = (len(values) + 1) // 2
+                    fig, axes = plt.subplots(nrows, 2,
+                                             figsize=(15, max(5.5, 4.2 * nrows)),
+                                             squeeze=False, layout="constrained")
                 fig.suptitle("EDDY QUAD - SNR and CNR", fontsize=19, weight="semibold")
                 for i in range(len(values)):
                     shell = shells[i - 1] if i > 0 and i - 1 < len(shells) else None
                     label = "b0 SNR" if i == 0 else (
                         f"b={shell} CNR" if shell is not None else f"Shell {i} CNR")
-                    nii = qcpath.parent / f"cnr{i:04d}.nii.gz"
-                    if nii.is_file():
+                    if use_numeric_maps:
+                        nii = numeric_maps[i]
                         data = self.volume(nii)
                         finite = data[np.isfinite(data) & (data >= 0)]
                         vmax = float(np.percentile(finite, 99)) if finite.size else 1
@@ -778,12 +787,24 @@ class _ModernReport:
                         colourbar.set_label("SNR" if i == 0 else "CNR", color=fg)
                     else:
                         png = qcpath.parent / f"cnr{i:04d}.nii.gz.png"
-                        for axis in axes[i, :]: axis.axis("off")
-                        if png.is_file(): axes[i, 1].imshow(plt.imread(png))
-                        else: axes[i, 1].text(.5, .5, "Spatial map unavailable",
-                                                  ha="center", va="center", color=fg)
+                        axis = axes.flat[i]
+                        axis.axis("off")
+                        axis.set_title(f"{label}: {values[i]:.2f}", color=fg,
+                                       fontsize=14, weight="semibold")
+                        if png.is_file():
+                            axis.imshow(plt.imread(png), interpolation="nearest")
+                        else:
+                            axis.text(.5, .5, "Spatial map unavailable",
+                                      ha="center", va="center", color=fg)
+                if not use_numeric_maps:
+                    for axis in axes.flat[len(values):]:
+                        axis.axis("off")
                 fig.savefig(out, dpi=165, facecolor=bg); plt.close(fig)
-        section["figures"].append({"title": "b0 SNR and shell CNR", "caption": "EDDY is diagnostic-only in this pipeline.", "light": "eddy_signal_light.png", "dark": "eddy_signal_dark.png", "sources": [str(qcpath), *(str(qcpath.parent / f"cnr{i:04d}.nii.gz") for i in range(len(values)))]})
+        caption = ("EDDY is diagnostic-only in this pipeline. Numeric maps use independent "
+                   "robust scales and colour bars." if use_numeric_maps else
+                   "EDDY is diagnostic-only in this pipeline. QUAD-rendered PNGs are shown "
+                   "because numeric CNR-map NIfTIs were unavailable.")
+        section["figures"].append({"title": "b0 SNR and shell CNR", "caption": caption, "light": "eddy_signal_light.png", "dark": "eddy_signal_dark.png", "sources": [str(qcpath), *(str(path) for path in numeric_maps)]})
 
     def _final_maps(self):
         data = self.source("final_data", self.value("data_4d"), self.root / "data" / "data.nii.gz")
@@ -847,7 +868,7 @@ class _ModernReport:
             lateral, medial = float(world_x.min()), float((world_x.min() + world_x.max()) / 2)
             world[0] = (lateral + medial) / 2
         command = [
-            executable, "render", "--outfile", str(output), "--size", "2400", "900",
+            executable, "render", "--outfile", str(output), "--size", "3000", "900",
             "--scene", "ortho", "--worldLoc", *(f"{value:.8f}" for value in world),
             "--displaySpace", str(reference),
             "--xzoom", "100", "--yzoom", "100", "--zzoom", "100",

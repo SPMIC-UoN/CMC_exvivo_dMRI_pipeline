@@ -579,7 +579,7 @@ class QAReport(SimpleInterface):
 class _ModernReport:
     """HTML/dual-PDF report for pipeline-owned ex-vivo outputs."""
 
-    REPORT_VERSION = "2026-10-27.2"
+    REPORT_VERSION = "2026-10-27.3"
 
     THEMES = {
         "light": ("#ffffff", "#172033", "#3274a1"),
@@ -696,18 +696,11 @@ class _ModernReport:
 
     def _stages(self):
         raw = self.source("raw_data", self._config_data())
-        current = raw
         pairs = []
         if bool(self.config.get("run_denoise", False)):
             den = self.source("denoised_data", self.root / "denoise" /
                               (str(self.config.get("denoise_name", "data")) + ".nii.gz"))
-            pairs.append(("Denoising", current, den, "Raw and denoised data with shared scaling.")); current = den or current
-        if current:
-            stem = current.name[:-7] if current.name.endswith(".nii.gz") else current.stem
-            gibbs = self.source("gibbs_data", self.root / "gibbs" / f"{stem}_gibbs3d.nii.gz",
-                                self.root / "gibbs" / f"{stem}_gibbs2d.nii.gz")
-        else: gibbs = None
-        pairs.append(("Gibbs unringing", current, gibbs, "Check high-contrast boundaries for reduced ringing without blurring."))
+            pairs.append(("Denoising", raw, den, "Raw and denoised data with shared scaling."))
         for number, (title, before, after, caption) in enumerate(pairs):
             section = self.section(title, caption)
             if before and after:
@@ -771,9 +764,10 @@ class _ModernReport:
         if fa:
             md = self.source("md_native", fa.with_name(fa.name.replace("_FA", "_MD")))
             v1 = self.source("v1_native", fa.with_name(fa.name.replace("_FA", "_V1")))
-            rows = [("FA", fa, 0)] + ([("MD", md, 0)] if md else [])
-            self.add_panel(tensor, "tensor", "FA and MD", "Pipeline-selected lower-shell tensor maps.", rows)
-            if not v1: tensor["notes"].append("V1 was not found beside the pipeline FA output.")
+            if md and v1:
+                self._tensor_panel(tensor, fa, md, v1)
+            else:
+                tensor["notes"].append("MD or V1 was not found beside the pipeline FA output.")
         else: tensor["notes"].append("Pipeline FA output was unavailable.")
 
         reg = self.section("Standard-space registration", "Subject FA with the configured template FA > 0.2 outlined in red.")
@@ -832,7 +826,105 @@ class _ModernReport:
             if src.is_file():
                 dst = self.figdir / name; shutil.copy2(src, dst)
                 section["figures"].append({"title": src.stem.replace("xtract_", "").title(), "caption": "Pipeline viewer export.", "light": dst.name, "dark": dst.name})
-        if not section["figures"]: section["notes"].append("XTRACT was not requested or viewer outputs were unavailable.")
+        if not section["figures"]:
+            tracts = sorted((xdir / "tracts").glob("*/densityNorm.nii.gz"))
+            if tracts:
+                self.sources["xtract_dir"] = str(xdir.resolve())
+                self.sources["xtract_tract_count"] = len(tracts)
+                self._xtract_density_panel(section, tracts)
+            else:
+                section["notes"].append("The selected XTRACT directory contained no viewer PNGs or normalised tract-density maps.")
+
+    def _tensor_panel(self, section, fa, md, v1):
+        names = {}
+        for theme, (bg, fg, _) in self.THEMES.items():
+            output = self.figdir / f"tensor_{theme}.png"
+            try:
+                fa_img = nib.load(str(fa)); fa_data = self.volume(fa)
+                md_img = nib.load(str(md)); v1_img = nib.load(str(v1))
+                if md_img.shape[:3] != fa_img.shape[:3] or v1_img.shape[:3] != fa_img.shape[:3]:
+                    raise ValueError("FA, MD and V1 do not share a spatial grid")
+                md_data = self.volume(md)
+                v1_data = np.asarray(
+                    nib.as_closest_canonical(v1_img).dataobj, dtype=np.float32
+                )
+                if v1_data.ndim != 4 or v1_data.shape[-1] < 3:
+                    raise ValueError(f"Expected a three-component V1 image, got {v1_data.shape}")
+                rgb = np.clip(np.abs(v1_data[..., :3]) * np.clip(fa_data[..., None], 0, 1), 0, 1)
+                finite_md = md_data[np.isfinite(md_data) & (md_data >= 0)]
+                md_max = float(np.percentile(finite_md, 99)) if finite_md.size else 1.0
+                with plt.rc_context({"figure.facecolor": bg, "axes.facecolor": bg,
+                                     "text.color": fg, "axes.labelcolor": fg}):
+                    fig, axes = plt.subplots(3, 3, figsize=(15, 10.5), layout="constrained")
+                    fig.suptitle("Lower-shell tensor maps", fontsize=18, weight="semibold")
+                    rows = (("FA", fa_data, "gray", 1.0),
+                            ("MD", md_data, "magma", md_max),
+                            ("V1 × FA", rgb, None, None))
+                    for i, (label, data, cmap, maximum) in enumerate(rows):
+                        for j, view in enumerate(self.views(data)):
+                            axes[i, j].imshow(view, cmap=cmap, vmin=0 if cmap else None,
+                                              vmax=maximum, interpolation="nearest")
+                            axes[i, j].set_title(("Sagittal", "Coronal", "Axial")[j] if i == 0 else "")
+                            axes[i, j].set_ylabel(label, color=fg, weight="semibold")
+                            axes[i, j].axis("off")
+                    fig.savefig(output, dpi=165, facecolor=bg); plt.close(fig)
+                names[theme] = output.name
+            except Exception as exc:
+                self.issue("warning", f"Could not render tensor maps ({theme})", exc)
+        if names:
+            section["figures"].append({
+                "title": "FA, MD and FA-modulated V1",
+                "caption": "FA and MD use independent display scales. V1 colour encodes absolute principal direction and FA modulates brightness.",
+                "light": names.get("light") or names.get("dark"),
+                "dark": names.get("dark") or names.get("light"),
+            })
+
+    def _xtract_density_panel(self, section, tracts):
+        preferred = ("cst_l", "cst_r", "atr_l", "atr_r", "fma", "fmi", "fx_l", "fx_r")
+        selected = sorted(tracts, key=lambda path: (
+            preferred.index(path.parent.name) if path.parent.name in preferred else 999,
+            path.parent.name,
+        ))[:8]
+        palette = np.asarray([[.38,.65,1],[1,.72,.25],[.21,.82,.61],[.97,.43,.48],
+                              [.68,.55,.96],[.99,.62,.35],[.30,.79,.89],[.93,.49,.80]])
+        names = {}
+        for theme, (bg, fg, _) in self.THEMES.items():
+            output = self.figdir / f"xtract_density_{theme}.png"
+            try:
+                reference = nib.load(str(selected[0])); rgb = None
+                for i, path in enumerate(selected):
+                    image = nib.load(str(path))
+                    if image.shape[:3] != reference.shape[:3] or not np.allclose(image.affine, reference.affine):
+                        from nibabel.processing import resample_from_to
+                        image = resample_from_to(image, (reference.shape[:3], reference.affine))
+                    data = np.asarray(image.dataobj, dtype=np.float32)
+                    nonzero = data[data > 0]
+                    if not nonzero.size: continue
+                    norm = np.clip(data / float(np.percentile(nonzero, 99)), 0, 1)[..., None]
+                    if rgb is None: rgb = np.zeros(data.shape + (3,), dtype=np.float32)
+                    rgb = np.maximum(rgb, norm * palette[i])
+                if rgb is None: raise ValueError("All selected tract-density maps were empty")
+                with plt.rc_context({"figure.facecolor": bg, "axes.facecolor": bg, "text.color": fg}):
+                    fig, axes = plt.subplots(1, 3, figsize=(16, 5.5), layout="constrained")
+                    fig.suptitle("XTRACT representative tract densities", fontsize=18, weight="semibold")
+                    for axis, title, image in zip(axes, ("Sagittal", "Coronal", "Axial"),
+                                                  (np.max(rgb, 0), np.max(rgb, 1), np.max(rgb, 2))):
+                        axis.imshow(np.rot90(image)); axis.set_title(title); axis.axis("off")
+                    from matplotlib.patches import Patch
+                    fig.legend([Patch(color=palette[i], label=path.parent.name)
+                                for i, path in enumerate(selected)], loc="lower center",
+                               ncol=4, frameon=False, labelcolor=fg)
+                    fig.savefig(output, dpi=165, facecolor=bg); plt.close(fig)
+                names[theme] = output.name
+            except Exception as exc:
+                self.issue("warning", f"Could not render XTRACT overview ({theme})", exc)
+        if names:
+            section["figures"].append({
+                "title": "Representative tract densities",
+                "caption": f"Maximum-intensity projections of {len(selected)} representative normalised tract-density maps.",
+                "light": names.get("light") or names.get("dark"),
+                "dark": names.get("dark") or names.get("light"),
+            })
 
     def build(self):
         # Avoid leaving obsolete panels (for example the removed spatial-drift
